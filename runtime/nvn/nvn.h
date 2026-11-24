@@ -124,7 +124,8 @@ typedef struct {
     bool recording;
     uint64_t guest;  // the guest NVNcommandBuffer*
     uint64_t owner;  // in a host overflow chunk (cmdbuf.c): the guest chunk whose list jumped there, else 0
-    uint64_t copy_row_stride, copy_image_stride;  // (SetCopyRowStride / SetCopyImageStride: this buffer's own)
+    uint64_t copy_row_stride, copy_image_stride;
+    uint64_t hw_size, hw_left;  // the game's last chunk: its size, and what the hardware's commands would leave of it (PokeV 0227145)  // (SetCopyRowStride / SetCopyImageStride: this buffer's own)
 } NvnCmdBuf;
 
 // One recorded command: header, the call's integer and float arguments, then copied data.

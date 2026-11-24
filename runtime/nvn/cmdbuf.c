@@ -31,14 +31,17 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
 // Host overflow chunks. Our records are far bigger than the hardware's commands (and some carry copied data), so a
 // record can outgrow what the game's memory callback hands out: the list then goes on in host memory. A chunk is
 // reached only through a jump from the guest chunk it continues (its owner), and lives until the game gives that
-// guest memory to a command buffer again (the old list is gone then).
+// guest memory to a command buffer again (the old list is gone then). Kept by owner in a hash: with the pacing below
+// there are thousands at a time.
 typedef struct Overflow { uint64_t owner; void *mem; struct Overflow *next; } Overflow;
-static Overflow *overflows;
+#define OVERFLOW_BUCKETS 4096
+static Overflow *overflows[OVERFLOW_BUCKETS];
 static pthread_mutex_t overflow_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned overflow_bucket(uint64_t owner) { return (unsigned)((owner >> 4) * 0x9E3779B97F4A7C15ull >> 52) & (OVERFLOW_BUCKETS - 1); }
 
 static void overflow_free(uint64_t owner) {
     pthread_mutex_lock(&overflow_lock);
-    for (Overflow **p = &overflows; *p;) {
+    for (Overflow **p = &overflows[overflow_bucket(owner)]; *p;) {
         if ((*p)->owner == owner) {
             Overflow *o = *p;
             *p = o->next;
@@ -51,14 +54,19 @@ static void overflow_free(uint64_t owner) {
     pthread_mutex_unlock(&overflow_lock);
 }
 
-static void overflow_chunk(NvnCmdBuf *cb, uint32_t need) {
-    uint64_t size = need + JUMP_RESERVE > 0x10000 ? need + JUMP_RESERVE : 0x10000;
+// Room for `need` bytes and the jump at the end, and for what the hardware would still record in the game's chunk at
+// our size: the records the pacing keeps out of the game's memory (at most 64 KB, or need if more).
+static void overflow_chunk(NvnCmdBuf *cb, uint32_t need, uint64_t ratio) {
+    uint64_t size = cb->hw_left * ratio + 2 * JUMP_RESERVE;
+    if (size > 0x10000 || !cb->callback || ratio == 1) size = 0x10000;  // (nobody to ask for more: as large as before)
+    if (size < need + JUMP_RESERVE) size = need + JUMP_RESERVE;
     Overflow *o = malloc(sizeof *o);
     o->owner = cb->owner ? cb->owner : cb->mem;
     o->mem = malloc(size);
     pthread_mutex_lock(&overflow_lock);
-    o->next = overflows;
-    overflows = o;
+    Overflow **head = &overflows[overflow_bucket(o->owner)];
+    o->next = *head;
+    *head = o;
     pthread_mutex_unlock(&overflow_lock);
     static int logged;
     if (logged++ < 5) LOG("[nvn] command memory overflow: %u bytes, list goes on in host memory\n", need);
@@ -85,13 +93,15 @@ NVN(nvnCommandBufferAddCommandMemory) {
     cb->mem = mem;
     cb->size = size;
     cb->used = 0;
+    cb->hw_size = cb->hw_left = size;
 }
 NVN(nvnCommandBufferAddControlMemory) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferAddControlMemory\n"); }
-NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->size); }
-NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used); }
+// (the game's view of its chunk: what the hardware would have used of it - see rec)
+NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->hw_size); }
+NVN(nvnCommandBufferGetCommandMemoryUsed) { NvnCmdBuf *cb = cb_of(A(0)); RET(cb->hw_size - cb->hw_left); }
 NVN(nvnCommandBufferGetCommandMemoryFree) {
     NvnCmdBuf *cb = cb_of(A(0));
-    RET(cb->size > cb->used + JUMP_RESERVE ? cb->size - cb->used - JUMP_RESERVE : 0);
+    RET(cb->hw_left > JUMP_RESERVE ? cb->hw_left - JUMP_RESERVE : 0);
 }
 NVN(nvnCommandBufferGetControlMemorySize) { RET(0x10000); }
 NVN(nvnCommandBufferGetControlMemoryUsed) { RET(0); }
@@ -102,27 +112,47 @@ NVN(nvnCommandBufferSetMemoryCallbackData) { cb_of(A(0))->callback_data = A(1); 
 NVN(nvnCommandBufferGetMemoryCallbackData) { RET(cb_of(A(0))->callback_data); }
 NVN(nvnCommandBufferSetCommandMemoryCallbackEnabled) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferSetCommandMemoryCallbackEnabled\n"); }
 
+// Command memory paced as the hardware's. A record here is 4-6 times the hardware's command for the same call (80
+// bytes and up against ~16-24), so the game's chunks filled that much sooner and it handed out that much more memory.
+// Scarlet / Violet keeps its command lists in a ~50 MB heap of 1 KB chunks; in a city its many NPCs' lists took it
+// down to 2 MB, and a few more ran it out - the allocator returned null and the game crashed reading through it
+// (f_7000c28198). Now each record charges the game's chunk a quarter of its size (LARECOMP_NVN_CMD_RATIO, 1 = the old
+// way: our own size), the game is asked for a new chunk only when that estimate runs out, and records past the end of
+// its chunk until then go on in host overflow chunks it owns.
+static uint64_t cmd_ratio(void) {
+    static uint64_t r;
+    if (!r) {
+        const char *e = ENV("LARECOMP_NVN_CMD_RATIO");
+        r = e && atoi(e) >= 1 && atoi(e) <= 16 ? (uint64_t)atoi(e) : 4;
+    }
+    return r;
+}
+
 // Reserve a record. May call back into the guest for more memory, so callers snapshot their
 // arguments first.
 static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     uint32_t size = (uint32_t)((sizeof(CmdRec) + extra + 7) & ~7u);
+    uint64_t ratio = cmd_ratio(), hw = (size + ratio - 1) / ratio;
     for (int tries = 0; !cb->mem || cb->used + size + JUMP_RESERVE > cb->size; tries++) {
+        // the hardware would still have room in the game's chunk: go on in host memory without asking for more
+        if (cb->mem && ratio > 1 && cb->hw_left >= hw + JUMP_RESERVE) { overflow_chunk(cb, size, ratio); break; }
         if (!cb->callback || tries == 2) {
             if (!cb->mem) FATAL("nvn: out of command memory (need %u)\n", size);
-            overflow_chunk(cb, size);
+            overflow_chunk(cb, size, ratio);
             break;
         }
         uint64_t saved[8];
         memcpy(saved, c->x, sizeof saved);
         c->x[0] = cb->guest;
         c->x[1] = 0;  // NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY
-        c->x[2] = size + JUMP_RESERVE;
+        c->x[2] = (ratio > 1 ? hw : size) + JUMP_RESERVE;
         c->x[3] = cb->callback_data;
         guest_call(c, cb->callback);
         memcpy(c->x, saved, sizeof saved);
     }
     CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
     cb->used += size;
+    cb->hw_left = cb->hw_left > hw ? cb->hw_left - hw : 0;
     return r;
 }
 
