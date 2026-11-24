@@ -6048,6 +6048,13 @@ static uint32_t xm_moves;
 // mirror - the game reuses the arena's memory (other data written by the CPU when areas / outfits change: read from
 // the mirror, a stale skinning drew the player black)
 static uint32_t xm_written[XM_SIZE / XM_CHUNK];
+// ... and the bytes of the chunk written that frame (one interval [lo, hi); two apart: the larger kept, the other then
+// read from the heap). A chunk counted as written whole when a session wrote any of it: a stream sharing the chunk
+// with another character's output - a few hundred bytes each in the arena - was read from the mirror where this frame
+// wrote nothing of it, the bytes of an earlier session, while the heap held what the game wrote there since: black
+// triangles hanging off an NPC and following it (a check of each mirror read against the bytes written found ~1 read
+// in 100 in a town).
+static uint16_t xm_wlo[XM_SIZE / XM_CHUNK], xm_whi[XM_SIZE / XM_CHUNK];
 static VkBufferCopy xm_back[256];  // this submission's written ranges (mirror -> heap)
 static int xm_back_n;
 static bool xm_draw;  // this draw's transform feedback goes to the mirror
@@ -6069,14 +6076,43 @@ static bool xm_inside(uint64_t a, uint64_t n) { return xm_lo && a >= xm_lo && a 
 static bool xm_all_written(uint64_t a, uint64_t n) {
     if (!n || !xm_inside(a, n)) return false;
     uint32_t now = (uint32_t)vk_frame_counter() + 1;
-    for (uint64_t c = (a - xm_lo) / XM_CHUNK; c <= (a + n - 1 - xm_lo) / XM_CHUNK; c++)
-        if (xm_written[c] != now) return false;
+    uint64_t s0 = a - xm_lo, s1 = s0 + n;
+    for (uint64_t c = s0 / XM_CHUNK; c <= (s1 - 1) / XM_CHUNK; c++) {
+        uint64_t clo = c * XM_CHUNK, l = s0 > clo ? s0 - clo : 0, h = s1 < clo + XM_CHUNK ? s1 - clo : XM_CHUNK;
+        if (xm_written[c] != now || l < xm_wlo[c] || h > xm_whi[c]) return false;
+    }
     return true;
+}
+
+// Does the program write transform feedback buffer b? (its control section's output count for b, as draw_ reads it
+// into vkey.xfb_count). A binding stays set from earlier sessions when a later program writes fewer buffers -
+// Pokémon Scarlet / Violet leaves buffer 3 bound for its skinning programs, which write 0..2, at an address 100 MB
+// from the arena. Counted, that binding sent each of those sessions to the heap (it lies outside the mirror's window)
+// while the other sessions over the same arena went to the mirror, and NPCs' faces seen up close were drawn from stale
+// skinning: they covered their own eyebrows and eyelashes (after walking up to them twice; LARECOMP_VK_XFB_MIRROR=0
+// hid it).
+static bool xm_buffer_used(int b) {
+    const uint8_t *ctl = st.program ? st.program->stages[0].control : NULL;
+    return !ctl || *(const uint32_t *)(ctl + 0x4DC + 0x80 * b) != 0;
 }
 
 // before a transform feedback draw: can its buffers all go to the mirror? (then they're marked written, and queued
 // for the copy back)
+static bool xm_prepare_(void);
 static bool xm_prepare(void) {
+    if (xm_prepare_()) return true;
+    // To the heap: the parts of the mirror its buffers cover no longer hold this frame's output (a later read of them
+    // takes the heap, where this session writes)
+    if (!xm_lo) return false;
+    for (int b = 0; b < 4; b++) {
+        if (!xfb_addr[b] || !xfb_size[b] || !xm_buffer_used(b)) continue;
+        uint64_t lo = xfb_addr[b] > xm_lo ? xfb_addr[b] : xm_lo, hi = xfb_addr[b] + xfb_size[b];
+        if (hi > xm_lo + XM_SIZE) hi = xm_lo + XM_SIZE;
+        for (uint64_t c = (lo - xm_lo) / XM_CHUNK; hi > lo && c <= (hi - 1 - xm_lo) / XM_CHUNK; c++) xm_written[c] = 0;
+    }
+    return false;
+}
+static bool xm_prepare_(void) {
     if (!xm_on() || !gmem_buf) return false;
     if (!xm_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = XM_SIZE,
@@ -6140,7 +6176,7 @@ static bool xm_prepare(void) {
     for (int b = 0; b < 4; b++)
         if (xfb_addr[b] && xfb_size[b] && xm_lo && !xm_inside(xfb_addr[b], xfb_size[b])) { sp_out++; break; }
     for (int b = 0; b < 4; b++) {
-        if (!xfb_addr[b] || !xfb_size[b]) continue;
+        if (!xfb_addr[b] || !xfb_size[b] || !xm_buffer_used(b)) continue;  // (a buffer the program doesn't write: left alone)
         if (!xm_lo) {  // placed around the first session's buffers (the arena is a few MB)
             uint64_t lo = (xfb_addr[b] & ~0xFFFFFull) - (16ull << 20);
             xm_lo = lo < gwin_base ? gwin_base : lo;
@@ -6154,10 +6190,19 @@ static bool xm_prepare(void) {
         }
     }
     for (int b = 0; b < 4; b++) {
-        if (!xfb_addr[b] || !xfb_size[b]) continue;
+        if (!xfb_addr[b] || !xfb_size[b] || !xm_buffer_used(b)) continue;
         uint64_t o = xfb_addr[b] - xm_lo;
         uint32_t now = (uint32_t)vk_frame_counter() + 1;
-        for (uint64_t c = o / XM_CHUNK; c <= (o + xfb_size[b] - 1) / XM_CHUNK; c++) xm_written[c] = now;
+        for (uint64_t c = o / XM_CHUNK; c <= (o + xfb_size[b] - 1) / XM_CHUNK; c++) {
+            uint64_t clo = c * XM_CHUNK, l = o > clo ? o - clo : 0, h = o + xfb_size[b] < clo + XM_CHUNK ? o + xfb_size[b] - clo : XM_CHUNK;
+            if (xm_written[c] != now || (h - l > (uint64_t)(xm_whi[c] - xm_wlo[c]) && (l > xm_whi[c] || h < xm_wlo[c]))) {
+                xm_wlo[c] = (uint16_t)l, xm_whi[c] = (uint16_t)h;  // (the first this frame, or a larger one apart)
+            } else if (l <= xm_whi[c] && h >= xm_wlo[c]) {  // (touching or overlapping: one interval)
+                if (l < xm_wlo[c]) xm_wlo[c] = (uint16_t)l;
+                if (h > xm_whi[c]) xm_whi[c] = (uint16_t)h;
+            }
+            xm_written[c] = now;
+        }
         int i = 0;
         while (i < xm_back_n && !(xm_back[i].srcOffset == o && xm_back[i].size == xfb_size[b])) i++;
         if (i == xm_back_n) {
@@ -6334,12 +6379,40 @@ static uint32_t *vc_page_gpu;  // per heap page: the frame the GPU last wrote it
 // (Lumiose: up to ~10 GB per 2 s, 7.6% of their pages GPU-written; ~54 fps where a fresh load ran 60). A binding
 // is read in place only when its own bytes meet written lines. LARECOMP_VC_PAGES=1: any written page, as before.
 static uint64_t *vc_page_lines;
+// Writes the OS loses. A write tracking query resets the pages' marks, and a store landing on a page while its mark is
+// reset (the game's thread rewriting its per-frame data with memcpy as the render thread asks) can go unrecorded: the
+// vertex cache kept its copy of the page from before, a frame's dynamic vertices stayed as they were, and Scarlet /
+// Violet's sandstorm, fog and the ground near them drew as huge stretched triangles - at random, as the race. A check
+// of every clean page's bytes against its copy (a scripted walk in a city) found such pages within seconds, nearly
+// all written 1-3 frames before. So a page seen written is unsettled for the next VC_RECENT frames, a lost store may
+// still be landing: whoever looks at it in that time (the vertex cache's copy, a texture upload check, the storage
+// watch) looks again after it settles - at the first look after the window, its generation then (vc_page_settle) is
+// what a look has to be newer than. (Counted from the look, not the clock: a range not drawn in those frames - an
+// object out of view for a moment - was copied before the window and served stale after it, a flickering triangle at
+// the academy's gate.)
+static uint32_t *vc_page_wfr;     // per heap page: the frame its last write was seen (+1; 0: never)
+static uint32_t *vc_page_settle;  // per heap page: the generation of the first look after its window (0: not yet)
+#define VC_RECENT 8u
+extern uint64_t vk_frame_counter(void);
+static uint32_t vc_gen = 1, vc_epoch = 1;  // (epoch: bumped when pages turn GPU-written: entries check again)
+static inline void vc_seen(uint64_t p, uint32_t g) {
+    vc_page_gen[p] = g;
+    vc_page_wfr[p] = (uint32_t)vk_frame_counter() + 1;
+    vc_page_settle[p] = 0;
+}
+// written since generation `since`, or maybe (a write seen, and `since` from before the page settled)?
+static inline bool vc_dirty(uint64_t p, uint32_t since) {
+    if (vc_page_gen[p] > since) return true;
+    if (!vc_page_wfr[p]) return false;
+    if ((uint32_t)vk_frame_counter() + 1 - vc_page_wfr[p] < VC_RECENT) return true;  // (still unsettled)
+    if (!vc_page_settle[p]) vc_page_settle[p] = vc_gen;
+    return since < vc_page_settle[p];
+}
 // A page the GPU hasn't written for this many frames is cached again (copied whole first): the game reuses its
 // memory, and pages a compute dispatch or transform feedback wrote once stayed read in place for the rest of the
 // session - the vertices read across PCIe grew to ~10 GB per 2 s after half an hour (GPU time +25%, 60 fps lost)
 #define VC_GPU_HOLD 120u
 static bool vc_gpu_expired;  // (an entry turned cacheable again: vc_flush orders its copy after the GPU's writes)
-static uint32_t vc_gen = 1, vc_epoch = 1;  // (epoch: bumped when pages turn GPU-written: entries check again)
 static uint64_t vc_bytes;
 #define VC_DEAD 1024
 static struct { VkBuffer b; VmaAllocation m; uint64_t seq; } vc_dead[VC_DEAD];
@@ -6379,6 +6452,8 @@ static bool pt_init(void) {
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
     vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
     vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gpu);
+    vc_page_wfr = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_wfr);
+    vc_page_settle = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_settle);
     vc_page_lines = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_lines);
     vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
     gmir_dirty(0);
@@ -6436,13 +6511,13 @@ static int pages_written(uint64_t addr, uint64_t size, uint32_t since, uint32_t 
     int n = plat_written_pages(gwin_base + lo, hi - lo, pages, 4096, &pg);
     if (n < 0) return -1;
     uint32_t g = ++vc_gen;
-    if (n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g, gmir_dirty(p);
-    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - gwin_base) / VC_PAGE] = g, gmir_dirty((pages[k] - gwin_base) / VC_PAGE);
+    if (n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_seen(p, g), gmir_dirty(p);
+    else for (int k = 0; k < n; k++) vc_seen((pages[k] - gwin_base) / VC_PAGE, g), gmir_dirty((pages[k] - gwin_base) / VC_PAGE);
     *now = g;
     int changed = 0;
     for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) {
         if (gpu_unknown && vc_page_gpu[p]) return -2;
-        if (vc_page_gen[p] > since) changed = 1;
+        if (vc_dirty(p, since)) changed = 1;
     }
     return changed;
 }
@@ -6579,8 +6654,8 @@ void vc_flush(void) {
         uint64_t pg = VC_PAGE;
         int n = plat_written_pages(gwin_base + lo, hi - lo, pages, 4096, &pg);
         prof_vc_queries++;
-        if (n < 0 || n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g, gmir_dirty(p);  // (all)
-        else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - gwin_base) / VC_PAGE] = g, gmir_dirty((pages[k] - gwin_base) / VC_PAGE);
+        if (n < 0 || n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_seen(p, g), gmir_dirty(p);  // (all)
+        else for (int k = 0; k < n; k++) vc_seen((pages[k] - gwin_base) / VC_PAGE, g), gmir_dirty((pages[k] - gwin_base) / VC_PAGE);
         if (n > 0) prof_vc_scan_pages += (uint64_t)n;
         i = j;
     }
@@ -6592,7 +6667,7 @@ void vc_flush(void) {
         VkBufferCopy cp[64];
         int nc = 0;
         for (uint64_t p = e->lo / VC_PAGE; p < e->hi / VC_PAGE; p++) {
-            if (e->gen && vc_page_gen[p] <= e->gen) continue;
+            if (e->gen && !vc_dirty(p, e->gen)) continue;
             uint64_t o = p * VC_PAGE;
             if (nc && cp[nc - 1].srcOffset + cp[nc - 1].size == o) { cp[nc - 1].size += VC_PAGE; continue; }
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)

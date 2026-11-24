@@ -422,6 +422,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
             b->astc_bw = fi->bw;
             b->astc_bh = fi->bh;
             b->astc_srgb = t->format >= 0x87;
+            { static int nastc; if (nastc++ < 12) LOG("[vk] ASTC texture decoded on the CPU: nvn fmt %#x %ux%u levels %u block %ux%u\n", t->format, tw, th, levels, fi->bw, fi->bh); }
             vf = b->astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
         } else {
             static int nlog;

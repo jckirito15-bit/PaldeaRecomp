@@ -433,12 +433,19 @@ static void builder_layout(uint64_t b, TexLayout *t) {
     t->levels = G(uint32_t, b, 0x1C) ? G(uint32_t, b, 0x1C) : 1;
     tegra_layout_init(t);
     // Packaged textures (BNTX) were swizzled offline with their own block height, which can differ
-    // from the driver default: NVNpackagedTextureLayout's low word is log2(GOBs per block).
+    // from the driver default: NVNpackagedTextureLayout's low word holds log2(GOBs per block) in height (bits 0-3) and,
+    // for 3D textures, in depth (bits 4-7). Scarlet / Violet's sky scattering table (32x128x32, RGBA16F) comes as 0x40:
+    // blocks one GOB high and 16 deep. Only the whole word <= 5 was read as a height, so that one kept the default
+    // (16 high, 32 deep), its slices came out shuffled and the sky had wide horizontal bands of light and dark.
     uint64_t pl = G(uint64_t, b, 0x50);
-    if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;
+    uint32_t pl_bh = (uint32_t)pl & 0xF, pl_bd = (uint32_t)pl >> 4 & 0xF;
+    if (pl && !((uint32_t)pl >> 8) && pl_bh <= 5 && pl_bd <= 5) {
+        t->block_height_log2 = pl_bh;
+        if (t->depth > 1) t->block_depth_log2 = pl_bd;
+    }
     if (pl && ENV("LARECOMP_LOG_PACKAGED")) {
         static int n;
-        if (n++ < 4000) LOG("[nvn] packaged layout %016llx fmt %#x %ux%u lv %u -> default bh %u\n", pl, G(uint32_t, b, 0x20), t->width, t->height, t->levels, t->block_height_log2);
+        if (n++ < 4000) LOG("[nvn] packaged layout %016llx fmt %#x %ux%ux%u lv %u -> bh %u bd %u\n", pl, G(uint32_t, b, 0x20), t->width, t->height, t->depth, t->levels, t->block_height_log2, t->block_depth_log2);
     }
 }
 
