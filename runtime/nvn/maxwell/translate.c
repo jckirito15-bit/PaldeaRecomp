@@ -1343,6 +1343,22 @@ static void light_tiles_fix(Ctx *c, const uint64_t *code, size_t end, uint32_t p
     sp(&c->body, "    r%d = as_type<uint>(as_type<float>(r%d) * (as_type<float>(%s) * as_type<float>(%s) / as_type<float>(%s)));\n", d, d, a, h, w);  // (GLSL: as_type is rewritten)
 }
 
+// A condition-code test (CSETP's bits 8..12, BRA's 0..4) on the zero / sign flags we model (ccz, ccs): NULL for the
+// tests that need the carry / overflow flags or NaN-ness, which aren't tracked. 15 is T (always).
+static const char *cc_test(int test) {
+    switch (test) {
+    case 0: return "false";
+    case 15: return "true";
+    case 2: case 10: return "ccz";
+    case 5: case 13: return "!ccz";
+    case 1: case 9: return "ccs";
+    case 6: case 14: return "!ccs";
+    case 4: case 12: return "(!ccz && !ccs)";
+    case 3: case 11: return "(ccz || ccs)";
+    default: return NULL;
+    }
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -1359,7 +1375,18 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     }
     bool guarded = !(pr == PT && !prn);
     if (pr == PT && prn) return;  // @!pt: never executes
-    if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
+    // BRA's condition-code test (bits 0..4, 15 = T): taken when the predicate and the test both hold. It goes into
+    // the guard, the one shape glsl_flatten reads a conditional branch in. Scarlet / Violet's deferred lighting (fs
+    // 74421cd200) skips its local lights with `@P0 BRA CC.NEU` after `ISET.NE.CC RZ, R47, 7`: every shading model
+    // but 4..7 skips, and the hair (7) doesn't. Without the test the hair skipped too, past the code that clears the
+    // light's terms, and added what the registers held from the sun's light - hair glowing purple / blue / cyan.
+    // (Tests on the carry / overflow flags aren't modelled: those branches run on the predicate alone, as before.)
+    const char *brcc = NULL;
+    if ((w & 0xfff0000000000020ull) == 0xe240000000000000ull && bits(w, 0, 5) != 15 && (brcc = cc_test((int)bits(w, 0, 5))))
+        c->uses_cc = true;
+    if (brcc && guarded) sp(&c->body, "  if (%s && %s) {\n", P(pr, prn), brcc);
+    else if (brcc) sp(&c->body, "  if (%s) {\n", brcc), guarded = true;
+    else if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
@@ -1743,6 +1770,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         icmp_expr(cmp, (int)bits(w, 49, 3), R(a), B(false), bits(w, 48, 1));
         sprintf(t, "((%s) %s %s)", cmp, bool_op((int)bits(w, 45, 2)), P((int)bits(w, 39, 3), bits(w, 42, 1)));
         sprintf(u, bits(w, 44, 1) ? "(%s ? 0x3f800000u : 0u)" : "(%s ? 0xFFFFFFFFu : 0u)", t);
+        if (bits(w, 47, 1)) {  // .CC: zero / sign flags of the result, often into RZ for a following BRA CC.xx
+            c->uses_cc = true;
+            sp(&c->body, "    { uint ccv = %s; ccz = ccv == 0u; ccs = int(ccv) < 0; }\n", u);
+        }
         set_reg(c, d, u);
     } else if (OPM(0x5c20000000000000ull, 0xfff8000000000000ull) || OPM(0x4c20000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3820000000000000ull, 0xfef8000000000000ull)) {  // IMNMX
@@ -2254,18 +2285,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
            (uint32_t)sbits(w, 20, 24));
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
-        const char *cond;
-        switch (test) {
-        case 0: cond = "false"; break;
-        case 15: cond = "true"; break;
-        case 2: case 10: cond = "ccz"; break;
-        case 5: case 13: cond = "!ccz"; break;
-        case 1: case 9: cond = "ccs"; break;
-        case 6: case 14: cond = "!ccs"; break;
-        case 4: case 12: cond = "(!ccz && !ccs)"; break;
-        case 3: case 11: cond = "(ccz || ccs)"; break;
-        default: cond = "false"; fail(c, "csetp test %d", test);
-        }
+        const char *cond = cc_test(test);
+        if (!cond) cond = "false", fail(c, "csetp test %d", test);
         c->uses_cc = true;
         int p = (int)bits(w, 3, 3), q = (int)bits(w, 0, 3), bo = (int)bits(w, 45, 2);
         const char *pc_ = P((int)bits(w, 39, 3), bits(w, 42, 1));
