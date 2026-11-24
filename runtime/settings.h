@@ -141,6 +141,9 @@ typedef struct {
     char livesplit_host[64];  // host:port of the LiveSplit Server ("localhost:16834")
     char rando_seed[128];  // active randomizer seed (rando/<name>/), empty = vanilla
     char rando_options[48];  // the Randomizer tab's New seed options: a seed ID without its random part (empty = defaults)
+    int npc_shown;       // Scarlet / Violet: town people shown at once; 0 the game's (12) (hle/npc_shown.c)
+    int npc_detail;      // Scarlet / Violet: town people's model detail distances times this; 0/1 the game's
+    int pokemon_detail;  // Scarlet / Violet: Pokémon's model detail distances times this; 0/1 the game's
     bool fps60_lock;  // with fps60: stays at 60 even when this PC can't hold it (slow motion below; runtime/hle/framepace.c)
     bool frame_dt;    // Pokémon Z-A: the world's step from a wall-clock accumulator (runtime/hle/framepace.c
                       // rt_za_frame_dt) - the same game speed at any frame rate. Off: the game's own step (slow motion

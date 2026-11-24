@@ -315,6 +315,9 @@ void settings_load(void) {
         else if (!strcmp(key, "content_stones")) g_settings.content_stones = atoi(val) != 0;
         else if (!strcmp(key, "content_trade")) g_settings.content_trade = atoi(val) != 0;
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
+        else if (!strcmp(key, "npc_shown")) { int v = atoi(val); g_settings.npc_shown = v < 0 ? 0 : v > 128 ? 128 : v; }
+        else if (!strcmp(key, "npc_detail")) { int v = atoi(val); g_settings.npc_detail = v < 1 ? 1 : v > 16 ? 16 : v; }
+        else if (!strcmp(key, "pokemon_detail")) { int v = atoi(val); g_settings.pokemon_detail = v < 1 ? 1 : v > 16 ? 16 : v; }
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
         else if (!strcmp(key, "frame_dt")) g_settings.frame_dt = atoi(val) != 0;
         else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
@@ -484,6 +487,12 @@ void settings_save(void) {
     fprintf(f, "content_stones = %d\ncontent_trade = %d\n", g_settings.content_stones, g_settings.content_trade);
     fprintf(f, "fps60 = %d\n", g_settings.fps60);
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
+        fprintf(f, "npc_shown = %d
+", g_settings.npc_shown);
+        fprintf(f, "npc_detail = %d
+", g_settings.npc_detail < 1 ? 1 : g_settings.npc_detail);
+        fprintf(f, "pokemon_detail = %d
+", g_settings.pokemon_detail < 1 ? 1 : g_settings.pokemon_detail);
     fprintf(f, "frame_dt = %d\n", g_settings.frame_dt);
     fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);
     fprintf(f, "full_detail_models = %d\n", g_settings.full_detail);
