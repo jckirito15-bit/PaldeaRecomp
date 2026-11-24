@@ -1,10 +1,14 @@
 <div align="center">
 
+<img src="docs/logo-professor-dazai.png" width="200" alt="Professor Dazai">
+
 # Paldea Recomp
 
 **Pokémon Scarlet e Violet 4.0.0 rodando nativo no PC com Windows. Sem emulador. Recompilação estática. 60 fps.**
 
 [English](README.md) · **Português (Brasil)** · **Versão 1.0**
+
+Publicado por **Professor Dazai**
 
 </div>
 
@@ -25,7 +29,7 @@ pequeno e a API gráfica (NVN) é traduzida para Vulkan. O jogo roda como qualqu
 |---|---|
 | Base: recompilador, runtime, camada do sistema Switch, renderizador NVN→Vulkan, launcher | **ZA Recomp v0.1.27** (MIT, copyright Peiikai; a versão usada foi a do Hexveil404). Está como primeiro commit deste repositório. O README dele fica em [docs/](docs/README-ZA-Recomp.pt-BR.md). |
 | Suporte ao Pokémon Violet 4.0.0, patches e serviços de memória | **PokeV-Recomp**, de [didslima](https://github.com/didslima) (com contribuições da comunidade, como Atterax). |
-| Scarlet, 4K Shadows, as correções abaixo e esta organização | Este projeto. |
+| Scarlet, 4K Shadows, as correções abaixo e esta organização | Este projeto, por **Professor Dazai**. |
 
 Mods da comunidade que o Paldea Recomp pode usar (**não estão aqui**, baixe no GameBanana): tradução para português
 do Brasil, Improved Graphic Quality, 4K Shadows, Shiny Lock Removal, Dark Void Accuracy Fix e No Trade Evolution.
