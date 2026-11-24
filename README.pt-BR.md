@@ -35,6 +35,22 @@ Mods da comunidade que o Paldea Recomp pode usar (**não estão aqui**, baixe no
 do Brasil, Improved Graphic Quality, 4K Shadows, Shiny Lock Removal, Dark Void Accuracy Fix e No Trade Evolution.
 Cada um pertence ao seu autor.
 
+## O que há de novo na v1.1
+
+Correções trazidas do trabalho mais recente do PokeV-Recomp, mais correções de bugs que ficaram abertos lá:
+
+1. **Texturas listradas e com arco-íris corrigidas** (mãos, Poké Bolas, cabelo, partes pretas piscando). As views de
+   textura agora usam o formato de 16 bytes do próprio jogo, e a leitura em modo stencil pega o plano de stencil da
+   cópia de profundidade.
+2. **Memória de comandos no mesmo ritmo do hardware real**, então quadros longos não ficam sem espaço de comando.
+3. **Oclusão de ambiente e iluminação** reconhecem a entrada de profundidade certa no Scarlet/Violet.
+4. **Crashes em piqueniques e nas batalhas de Titã corrigidos** (issues #18/#19 do PokeV): o recompilador agora acha
+   tabelas de salto até 48 instruções antes do desvio.
+5. **Quadro preto no começo das batalhas corrigido** (issue #26 do PokeV): programas de shader criados durante a
+   sessão são achados de novo pelo conteúdo.
+6. **Som da tela de título**: o serviço de decodificação de áudio Opus (`hwopus`) foi implementado.
+7. Alpha-to-coverage só em alvos com multisample, e uma correção de concorrência no cache de vértices.
+
 ## O que fizemos (v1.0)
 
 1. **Juntamos as duas bases.** O Violet do PokeV-Recomp passou a rodar sobre o runtime mais novo do ZA Recomp
