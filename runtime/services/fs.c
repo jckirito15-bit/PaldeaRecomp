@@ -1,0 +1,1855 @@
+// fsp-srv: RomFS as a raw storage image, save data and SD card backed by host directories.
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#undef IN   // (windows.h's empty parameter markers; ipc.h defines its own)
+#undef OUT
+#endif
+
+#include <pthread.h>
+
+#include "../hle.h"
+#include "../platform.h"
+#include "../rando.h"
+#include "../settings.h"
+#include "../ipc.h"
+#include "../romfs_build.h"
+#include "../input_bind.h"
+#include "../xbox_attack_layout.h"
+#include "mod_layout.h"
+#include "../paths.h"
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+#define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
+#define FS_PATH_EXISTS MAKE_RESULT(2, 2)
+#define FS_TARGET_LOCKED MAKE_RESULT(2, 7)
+#define FS_NOT_EMPTY MAKE_RESULT(2, 8)
+
+const char *g_save_dir = "save";
+
+// ------------------------------------------------------------------ the base RomFS image
+// The game reads its data as one raw RomFS image. It's served from the player's romfs/ folder: the header and tables
+// laid out in memory (runtime/romfs_build.c), each file's bytes read from its own file, the gaps between files zeros -
+// no image file on disk, so the game data isn't kept twice. A romfs.bin from an older version is used only when the
+// folder isn't there.
+static RomfsLayout g_base;
+static bool g_base_open;
+static int g_base_fd = -1;  // (an older version's romfs.bin)
+static pthread_mutex_t g_base_lock = PTHREAD_MUTEX_INITIALIZER;
+#define BASE_FDS 32  // files kept open (macOS allows 256 open files by default)
+static struct { int file, fd; uint64_t used; } g_base_fds[BASE_FDS];
+static uint64_t g_base_tick;
+
+static int base_file_fd(int i) {  // (g_base_lock held)
+    int slot = 0;
+    for (int k = 0; k < BASE_FDS; k++) {
+        if (g_base_fds[k].fd > 0 && g_base_fds[k].file == i) { g_base_fds[k].used = ++g_base_tick; return g_base_fds[k].fd; }
+        if (g_base_fds[k].used < g_base_fds[slot].used) slot = k;
+    }
+    if (g_base_fds[slot].fd > 0) close(g_base_fds[slot].fd);
+    int fd = open(g_base.files[i].path, O_RDONLY);
+    g_base_fds[slot].file = i, g_base_fds[slot].fd = fd > 0 ? fd : 0, g_base_fds[slot].used = ++g_base_tick;
+    return fd;
+}
+
+static uint64_t base_size(void) {
+    if (g_base_fd >= 0) {
+        struct stat sb;
+        fstat(g_base_fd, &sb);
+        return (uint64_t)sb.st_size;
+    }
+    return g_base.size;
+}
+
+// n bytes of the base image at off (past its end: zeros)
+static ssize_t base_pread(void *dst_, uint64_t n, uint64_t off) {
+    if (g_base_fd >= 0) return pread(g_base_fd, dst_, n, (off_t)off);
+    uint8_t *dst = dst_;
+    memset(dst, 0, n);
+    uint64_t end = off + n;
+    if (off < ROMFS_DATA_START) memcpy(dst, g_base.header + off, (end < ROMFS_DATA_START ? end : ROMFS_DATA_START) - off);
+    uint64_t ta = g_base.tables_off, tb = ta + g_base.tables_size;
+    if (off < tb && end > ta) {
+        uint64_t a = off > ta ? off : ta, b = end < tb ? end : tb;
+        memcpy(dst + (a - off), g_base.tables + (a - ta), b - a);
+    }
+    // the files overlapping [off, end): the first by binary search, then in order
+    int lo = 0, hi = g_base.nfiles - 1, first = g_base.nfiles;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_base.files[mid].start + g_base.files[mid].size > off) first = mid, hi = mid - 1;
+        else lo = mid + 1;
+    }
+    pthread_mutex_lock(&g_base_lock);
+    for (int i = first; i < g_base.nfiles && g_base.files[i].start < end; i++) {
+        const RomfsLayoutFile *f = &g_base.files[i];
+        uint64_t a = off > f->start ? off : f->start, b = end < f->start + f->size ? end : f->start + f->size;
+        if (a >= b) continue;
+        int fd = base_file_fd(i);
+        if (fd <= 0 || pread(fd, dst + (a - off), b - a, (off_t)(a - f->start)) != (ssize_t)(b - a)) {
+            pthread_mutex_unlock(&g_base_lock);
+            LOG("[fs] can't read %s\n", f->path);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&g_base_lock);
+    return (ssize_t)n;
+}
+
+static void base_close(void) {
+    for (int k = 0; k < BASE_FDS; k++) if (g_base_fds[k].fd > 0) close(g_base_fds[k].fd);
+    memset(g_base_fds, 0, sizeof g_base_fds);
+    romfs_layout_free(&g_base);
+    if (g_base_fd >= 0) close(g_base_fd);
+    g_base_fd = -1;
+    g_base_open = false;
+}
+
+static void base_open(void) {
+    if (g_base_open) return;
+    char path[1100], why[256] = "";
+    // (the folder: Link's Awakening's has region_common; Pokémon Z-A's, copied from extracted files, has no romfs.bin
+    // beside it - the import from its packages writes only that)
+    struct stat sb;
+    snprintf(path, sizeof path, "%s.bin", g_romfs_dir);
+    bool image = stat(path, &sb) == 0;
+    snprintf(path, sizeof path, "%s/region_common", g_romfs_dir);
+    bool folder = stat(path, &sb) == 0 || (!image && stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode));
+    if (folder && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
+        LOG("[fs] romfs: %d files served from %s\n", g_base.nfiles, g_romfs_dir);
+        // (Pokémon Z-A: the data index's size tells the data's version - #121 #138 crashed on 1.0.0 code at its first
+        // scene, a 6 GiB list read from data, on any GPU: a folder extracted elsewhere, maybe from another version.
+        // 2.0.0's is 9877520 bytes)
+        snprintf(path, sizeof path, "%s/arc/data.trpfd", g_romfs_dir);
+        if (stat(path, &sb) == 0) {
+            LOG("[fs] romfs: arc/data.trpfd %lld bytes (a folder extracted by another tool)\n", (long long)sb.st_size);
+            // (#311: a folder with Pokémon Z-A's index but not its packs - the game read null as it started. The start
+            // screen says so too: runtime/ui/launcher.mm launcher_verify_kick)
+            snprintf(path, sizeof path, "%s/arc/data.trpfs", g_romfs_dir);
+            bool none = stat(path, &sb) != 0;
+            if (none || sb.st_size < (1 << 20))
+                FATAL("the game files are incomplete: %s/arc/data.trpfs is %s (the game's packs, about 4.7 GB)\n",
+                      g_romfs_dir, none ? "missing" : "almost empty");
+        }
+    } else {
+        snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // (an older version's image)
+        if (stat(path, &sb) == 0) LOG("[fs] romfs: %s.bin, %lld bytes\n", g_romfs_dir, (long long)sb.st_size);
+        g_base_fd = open(path, O_RDONLY);
+        if (g_base_fd < 0) FATAL("cannot read the game data in %s %s(set up the game files on the start screen)\n",
+                                 g_romfs_dir, why);
+    }
+    g_base_open = true;
+}
+
+// ------------------------------------------------------------------ RomFS file index (offset -> path)
+typedef struct { uint64_t start, size; char *path; bool warned; const uint8_t *mem; } Overlay;
+// in-image patches (copies of RomFS tables with changes): header, dir meta, file hash, file meta
+typedef struct { uint64_t off, size; uint8_t *data; } Patch;
+static Patch patches[16];
+static int npatches;
+static Overlay *ov;
+static int ov_n, ov_cap;
+static uint8_t *ov_meta;
+static uint64_t ov_meta_off, ov_meta_size, ov_end;
+// Lets the runtime see which game files are being streamed (e.g. which level is loading).
+typedef struct { uint64_t off, size; char *path; uint32_t meta; } RomFile;
+static RomFile *rom_files;
+static int rom_nfiles;
+static uint64_t rom_data_off;
+
+// A seed replaces ~850 files and adds more: each is opened when it's read and kept in a small cache like the base
+// files', never all at once. They used to stay open until reboot, which ran into the open-file limit (256 for a
+// macOS app) mid-play: saves failed to stage ("could not be saved") and seed-file reads came back as zeros.
+#define OV_FDS 64
+static struct { int ov, fd; uint64_t used; } g_ov_fds[OV_FDS];
+static uint64_t g_ov_tick;
+static pthread_mutex_t g_ov_lock = PTHREAD_MUTEX_INITIALIZER;
+int fs_overlay_open_fds(void) {  // (tests)
+    int n = 0;
+    pthread_mutex_lock(&g_ov_lock);
+    for (int k = 0; k < OV_FDS; k++) n += g_ov_fds[k].fd > 0;
+    pthread_mutex_unlock(&g_ov_lock);
+    return n;
+}
+static void ov_fds_close(void) {  // (g_ov_lock held)
+    for (int k = 0; k < OV_FDS; k++) if (g_ov_fds[k].fd > 0) close(g_ov_fds[k].fd);
+    memset(g_ov_fds, 0, sizeof g_ov_fds);
+}
+// replacement file i's fd, opened on demand (-1, logged once per file, if it can't be opened; g_ov_lock held)
+static int ov_file_fd(int i) {
+    int slot = 0;
+    for (int k = 0; k < OV_FDS; k++) {
+        if (g_ov_fds[k].fd > 0 && g_ov_fds[k].ov == i) { g_ov_fds[k].used = ++g_ov_tick; return g_ov_fds[k].fd; }
+        if (g_ov_fds[k].used < g_ov_fds[slot].used) slot = k;
+    }
+    if (g_ov_fds[slot].fd > 0) close(g_ov_fds[slot].fd);
+    g_ov_fds[slot].fd = 0, g_ov_fds[slot].used = 0;
+    int fd = open(ov[i].path, O_RDONLY);
+    if (fd < 0 && (errno == EMFILE || errno == ENFILE)) {  // out of descriptors: give back the cache's, try once more
+        int error = errno;
+        ov_fds_close();
+        fd = open(ov[i].path, O_RDONLY);
+        if (fd < 0) errno = error;
+    }
+    if (fd < 0) {
+        if (!ov[i].warned) LOG("[fs] ERROR: can't open randomizer file %s (%s): the game reads zeros there\n", ov[i].path,
+                               strerror(errno));
+        ov[i].warned = true;
+        return -1;
+    }
+    if (fd == 0) {  // (0 marks a free slot: keep stdin's number out of the cache)
+        int d = dup(fd);
+        close(fd);
+        fd = d;
+        if (fd < 0) return -1;
+    }
+    g_ov_fds[slot].ov = i, g_ov_fds[slot].fd = fd, g_ov_fds[slot].used = ++g_ov_tick;
+    return fd;
+}
+
+// Reboot: the next seed builds its own index / overlay when the game opens the RomFS again.
+static void mounts_reset(void);
+RT_ON_RESET(fs_reset) {
+    pthread_mutex_lock(&g_ov_lock);
+    ov_fds_close();
+    pthread_mutex_unlock(&g_ov_lock);
+    for (int i = 0; i < ov_n; i++) free(ov[i].path);
+    for (int i = 0; i < npatches; i++) free(patches[i].data);  // (ov_meta and the extended table are among these)
+    for (int i = 0; i < rom_nfiles; i++) free(rom_files[i].path);
+    free(ov), free(rom_files);
+    ov = NULL, ov_n = ov_cap = 0;
+    ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
+    npatches = 0;
+    rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
+    base_close();
+    mounts_reset();  // (the old boot's mounts are gone with it)
+    g_save_dir = "save";
+}
+
+static int rom_cmp(const void *a, const void *b) {
+    const RomFile *x = a, *y = b;
+    return x->off < y->off ? -1 : x->off > y->off;
+}
+
+static void rom_dir_path(const uint8_t *dmeta, uint32_t dsize, uint32_t dir, char *out, size_t cap) {
+    char parts[16][256];
+    int n = 0;
+    // (every read inside the table: a damaged or crafted romfs.bin - an entry near its end, a name length past it - read
+    // beyond the copy of the directory table before)
+    while (dir != 0 && dsize >= 0x18 && dir <= dsize - 0x18 && n < 16) {  // root (offset 0) has an empty name
+        uint32_t parent, namelen;
+        memcpy(&parent, dmeta + dir, 4);
+        memcpy(&namelen, dmeta + dir + 0x14, 4);
+        if (namelen > 255) namelen = 255;
+        if (namelen > dsize - dir - 0x18) namelen = dsize - dir - 0x18;
+        memcpy(parts[n], dmeta + dir + 0x18, namelen);
+        parts[n][namelen] = 0;
+        n++;
+        dir = parent;
+    }
+    out[0] = 0;
+    for (int i = n - 1; i >= 0; i--) { strlcat(out, parts[i], cap); strlcat(out, "/", cap); }
+}
+
+// ---- layered files: a randomizer seed's romfs/ folder, then each mods/<name>/romfs folder in the start screen's order
+// (settings mods_order; the rest by name; a folder in mods_off, or whose name starts with '_' or '.', is off); the
+// first layer with a file wins. A file the game's RomFS has is replaced (rom_index: its file-meta entry pointed at data
+// past the image's end); a new one is added (add_new_files), with any directories it needs.
+// Pokémon Z-A keeps its files in packs (arc/data.trpfs) listed by arc/data.trpfd, and reads a file from the RomFS
+// only when the list doesn't have it: so the game's data.trpfd is served without the layered files' entries
+// (trpfd_unlist). A mod's own data.trpfd is never used (it's made for the mod's game version).
+static char layer_root[19][1100];  // seed + optional Xbox presentation + 15 user mods + full-detail models + draw distance
+static int nlayers = -1;
+static bool trinity;  // the RomFS has arc/data.trpfd
+static uint8_t *xbox_arc;
+static XboxAttackResource xbox_resource;
+RT_ON_RESET(layer_reset) { nlayers = -1; trinity = false; free(xbox_arc); xbox_arc = NULL; }
+
+// Called only when indexing the RomFS. Verify the current game's packed source,
+// not merely the installed overlay, so another game version keeps its own UI.
+static bool xbox_layer_prepare(void) {
+    if (!g_settings.xbox_attack_layout) return false;
+    const char *why = NULL;
+    uint8_t mapping[4];
+    if (g_settings.battle_abxy_position) why = "Battle moves by position must be OFF (controls are unchanged)";
+    else if (!xbox_attack_mapping(g_bind_pad, mapping)) why = "four distinct face bindings required";
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!why && !pack) why = "unsupported source pack";
+    if (why) { LOG("[xbox-layout] disabled: %s\n", why); return false; }
+    uint8_t meta[XBOX_ATTACK_METADATA_SIZE];
+    FILE *mf = fopen(XBOX_ATTACK_METADATA, "rb");
+    if (!mf) { LOG("[xbox-layout] disabled: automatic preparation missing (textures/prompts.log)\n"); return false; }
+    bool meta_ok = fread(meta, 1, sizeof meta, mf) == sizeof meta && fgetc(mf) == EOF && !ferror(mf) &&
+                   xbox_attack_resource(meta, sizeof meta, &xbox_resource);
+    fclose(mf);
+    if (!meta_ok) { LOG("[xbox-layout] disabled: invalid resource metadata\n"); return false; }
+    XboxAttackResource *xr = &xbox_resource;
+    if (xr->pack_offset > pack->size || xr->pack_size > pack->size - xr->pack_offset ||
+        pack->off > UINT64_MAX - xr->pack_offset - xr->pack_size) {
+        LOG("[xbox-layout] disabled: source range out of bounds\n"); return false;
+    }
+    uint8_t *packed = malloc((size_t)xr->pack_size);
+    if (!packed) { LOG("[xbox-layout] disabled: allocation failed\n"); return false; }
+    bool source_ok = base_pread(packed, xr->pack_size, pack->off + xr->pack_offset) == (ssize_t)xr->pack_size &&
+                     xbox_attack_fnv(packed, (size_t)xr->pack_size) == xr->pack_fnv;
+    free(packed);
+    if (!source_ok) { LOG("[xbox-layout] disabled: source resource/version mismatch\n"); return false; }
+    FILE *f = fopen(XBOX_ATTACK_HOST, "rb");
+    if (!f) { LOG("[xbox-layout] disabled: missing %s\n", XBOX_ATTACK_HOST); return false; }
+    uint8_t *data = malloc((size_t)xr->arc_size);
+    bool ok = data && fread(data, 1, (size_t)xr->arc_size, f) == xr->arc_size && fgetc(f) == EOF && !ferror(f);
+    fclose(f);
+    if (ok) ok = xbox_attack_relabel(data, (size_t)xr->arc_size, g_bind_pad, xr, &why);
+    if (!ok) { free(data); LOG("[xbox-layout] disabled: %s\n", why ? why : "unreadable overlay"); return false; }
+    xbox_arc = data;
+    LOG("[xbox-layout] enabled: top=%u right=%u left=%u bottom=%u (pane identities; controls unchanged)\n",
+        mapping[0], mapping[1], mapping[2], mapping[3]);
+    return true;
+}
+
+// F1 > Full-detail models (#190): cache/maxlod/romfs, every model's mesh slots on its full mesh (tools/za/lod_mod.py,
+// made by zaprompts --maxlod from the player's own files: runtime/ui/launcher.mm launcher_maxlod_kick). The last layer:
+// a player's mod with the same model wins. Only for the game it was made from: cache/maxlod/.made holds that game's
+// data.trpfs size (each version's differs), checked against the RomFS served now.
+// F1 > Draw distance (#190): cache/drawdist/romfs, the scene parts holding the world's trinity_ModelLodSetting /
+// trinity_ModelCullingSetting tables with their distances scaled (tools/za/draw_dist.py via zaprompts --drawdist).
+// .made: the data.trpfs size and the factor in percent - both must match this game and the setting.
+// Both are made in the background by zaprompts (the launcher starts it, then the game) into DIR.new, .made written last.
+// They used to be swapped in by zaprompts itself as soon as they were done - while the game was playing from the old
+// DIR: it deleted the files the game was serving, which read as zeros from then on, and a model read as zeros is a
+// crash (#266: "can't open randomizer file cache/maxlod/romfs/ik_pokemon/.../pm0158_00_00.trmdl (No such file or
+// directory)", then "accessing 0" in f_7001864c30). Now a finished DIR.new is taken in here, at the start, before
+// anything is served from DIR: the old DIR is moved aside first, so if it can't be (in use), nothing changes.
+static void cache_take_new(const char *dir) {
+    char nd[300], made[320], old[300];
+    snprintf(nd, sizeof nd, "%s.new", dir), snprintf(made, sizeof made, "%s/.made", nd), snprintf(old, sizeof old, "%s.old", dir);
+    struct stat st;
+    if (stat(made, &st)) return;  // (none, or still being made)
+    if (!stat(old, &st)) plat_remove_tree(old);
+    if (!stat(dir, &st) && rename(dir, old)) {
+        LOG("[fs] %s: a new one is ready, but the old one can't be moved aside (%s): taken in at a later start\n",
+            dir, strerror(errno));
+        return;
+    }
+    if (rename(nd, dir)) {
+        LOG("[fs] %s: the new one can't be moved in (%s)\n", dir, strerror(errno));
+        if (!stat(old, &st)) rename(old, dir);
+        return;
+    }
+    plat_remove_tree(old);
+    LOG("[fs] %s: the one made in the background taken in\n", dir);
+}
+bool g_drawdist_on;
+static void drawdist_layer(void) {
+    if (g_settings.draw_dist == 100) return;
+    cache_take_new("cache/drawdist");
+    unsigned long long made = 0;
+    int pct = 0;
+    FILE *f = fopen("cache/drawdist/.made", "rb");
+    if (!f) { LOG("[fs] draw distance %d%%: not made yet (cache/drawdist.log)\n", g_settings.draw_dist); return; }
+    if (fscanf(f, "%llu %d", &made, &pct) != 2) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made || pct != g_settings.draw_dist) {
+        LOG("[fs] draw distance %d%%: made for another game version or distance (%llu, %d%%): off until made again\n",
+            g_settings.draw_dist, made, pct);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/drawdist/romfs", sizeof *layer_root);
+    g_drawdist_on = true;
+    LOG("[fs] draw distance: %d%% (cache/drawdist)\n", pct);
+}
+
+// F1 > Content: cache/content/romfs, the item, shop and evolution tables with the Ranked Battle Mega Stones on sale for
+// Mega Shards and the trade evolutions that need no trade (tools/za/content_mod.py via zaprompts --content,
+// runtime/ui/launcher.mm launcher_content_kick). After the player's mods: a mod with the same table wins. Only for the
+// game and the choices it was made from (cache/content/.made: data.trpfs's size, "stones+tradeevo").
+const char *content_want(void) {
+    return g_settings.content_stones && g_settings.content_trade ? "stones+tradeevo"
+         : g_settings.content_stones ? "stones" : g_settings.content_trade ? "tradeevo" : "";
+}
+bool g_content_on;  // (this session serves cache/content: F1 says so)
+static void content_layer(void) {
+    if (!*content_want()) return;
+    cache_take_new("cache/content");
+    unsigned long long made = 0;
+    char what[32] = "";
+    FILE *f = fopen("cache/content/.made", "rb");
+    if (!f) { LOG("[fs] content (%s): not made yet (cache/content.log)\n", content_want()); return; }
+    if (fscanf(f, "%llu %31s", &made, what) != 2) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made || strcmp(what, content_want())) {
+        LOG("[fs] content (%s): made for another game version or choice (%llu, %s): off until made again\n",
+            content_want(), made, what);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/content/romfs", sizeof *layer_root);
+    g_content_on = true;
+    LOG("[fs] content: %s (cache/content)\n", what);
+}
+
+bool g_maxlod_on;  // (this session serves cache/maxlod: F1 says so)
+static void maxlod_layer(void) {
+    if (!g_settings.full_detail) return;
+    cache_take_new("cache/maxlod");
+    unsigned long long made = 0;
+    FILE *f = fopen("cache/maxlod/.made", "rb");
+    if (!f) { LOG("[fs] full-detail models: not made yet (cache/maxlod.log)\n"); return; }
+    if (fscanf(f, "%llu", &made) != 1) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made) {
+        LOG("[fs] full-detail models: made for another game version (data.trpfs %llu, now %llu): off until made again\n",
+            made, pack ? (unsigned long long)pack->size : 0ull);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/maxlod/romfs", sizeof *layer_root);
+    g_maxlod_on = true;
+    LOG("[fs] full-detail models: on (cache/maxlod)\n");
+}
+
+static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+// mods_order's place (unlisted: after every listed one), then the name
+static int mod_rank(const char *name) {
+    int i = 0;
+    for (const char *p = g_settings.mods_order; *p; i++) {
+        const char *bar = strchr(p, '|');
+        size_t k = bar ? (size_t)(bar - p) : strlen(p);
+        if (k == strlen(name) && !strncmp(p, name, k)) return i;
+        if (!bar) break;
+        p = bar + 1;
+    }
+    return 1 << 20;
+}
+static int mod_cmp(const void *a, const void *b) {
+    int ra = mod_rank((const char *)a), rb = mod_rank((const char *)b);
+    return ra != rb ? (ra < rb ? -1 : 1) : name_cmp(a, b);
+}
+
+// The start screen's check of the game files (runtime/ui/launcher.mm launcher_verify_kick): its result in the log, so
+// a crash report says at once whether the player's files are a damaged download (#294 #301)
+static void verify_log(void) {
+    FILE *f = fopen("cache/verify.txt", "rb");
+    if (!f) { LOG("[fs] game files: not checked yet (the start screen checks them once)\n"); return; }
+    char line[256];
+    for (int n = 0; n < 6 && fgets(line, sizeof line, f); n++) {
+        line[strcspn(line, "\r\n")] = 0;
+        LOG("[fs] game files%s %s\n", n ? ", damaged pack:" : ":", line);
+    }
+    fclose(f);
+}
+
+static void layer_init(void) {
+    if (nlayers >= 0) return;
+    nlayers = 0;
+    settings_load();
+    if (!g_game_is_la) verify_log();
+    if (xbox_layer_prepare()) strlcpy(layer_root[nlayers++], XBOX_ATTACK_ROOT, sizeof *layer_root);
+    const char *seed = rando_seed_dir();
+    if (seed) snprintf(layer_root[nlayers++], sizeof *layer_root, "%s/romfs", seed);
+    DIR *d = opendir("mods");
+    if (!d) { maxlod_layer(); drawdist_layer(); content_layer(); return; }  // (no mods folder: ours still)
+    char names[15][256];
+    int n = 0;
+    settings_load();  // (the start screen's Mods page: mods_off, mods_order)
+    for (struct dirent *e; (e = readdir(d)) && n < 15;) {
+        if (e->d_name[0] == '.' || e->d_name[0] == '_') continue;
+        if (settings_list_has(g_settings.mods_off, e->d_name)) { LOG("[fs] mod %s: off\n", e->d_name); continue; }
+        char p[1100], romfs[1100];
+        snprintf(p, sizeof p, "mods/%s", e->d_name);
+        // (the code isn't run: the files are, and many code mods carry their own romfs)
+        if (mod_has_code(p) && !settings_mod_code_on(e->d_name)) LOG("[fs] mod %s: has code (exefs), turned off\n", e->d_name);
+        if (mod_romfs_dir(p, romfs, sizeof romfs)) strlcpy(names[n++], e->d_name, sizeof *names);
+    }
+    closedir(d);
+    qsort(names, n, sizeof *names, mod_cmp);
+    for (int i = 0; i < n; i++) {
+        char p[1100];
+        snprintf(p, sizeof p, "mods/%s", names[i]);
+        mod_romfs_dir(p, layer_root[nlayers], sizeof *layer_root);  // (mods/<name>/romfs, or the Switch / Ryujinx layout)
+        LOG("[fs] mod: %s (%s)\n", names[i], layer_root[nlayers++]);
+        rt_mods_on++;
+    }
+    maxlod_layer();
+    drawdist_layer();
+    content_layer();
+}
+
+static bool layer_file(const char *path, char *out, size_t cap) {
+    layer_init();
+    if (trinity && !strcmp(path, "arc/data.trpfd")) return false;
+    for (int i = 0; i < nlayers; i++) {
+        snprintf(out, cap, "%s/%s", layer_root[i], path);
+        struct stat sb;
+        if (!stat(out, &sb) && S_ISREG(sb.st_mode)) return true;
+    }
+    return false;
+}
+
+static uint32_t romfs_hash(uint32_t parent, const char *name, uint32_t len) {
+    uint32_t hash = parent ^ 123456789;
+    for (uint32_t i = 0; i < len; i++) { hash = (hash >> 5) | (hash << 27); hash ^= (uint8_t)name[i]; }
+    return hash;
+}
+
+static int path_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+typedef struct { char rel[1024]; char host[1200]; uint64_t size; uint32_t dir; } NewFile;
+
+// the files under root/rel not in `known` (sorted; NULL: all of them)
+static void walk_new(const char *root, const char *rel, char **known, int nknown, NewFile **out, int *n, int *cap) {
+    char dirp[1200];
+    snprintf(dirp, sizeof dirp, "%s/%s", root, rel);
+    DIR *d = opendir(dirp);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char r2[1024], h2[1200];
+        snprintf(r2, sizeof r2, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
+        snprintf(h2, sizeof h2, "%s/%s", root, r2);
+        struct stat sb;
+        if (stat(h2, &sb)) continue;
+        if (S_ISDIR(sb.st_mode)) { walk_new(root, r2, known, nknown, out, n, cap); continue; }
+        const char *key = r2;
+        if (known && bsearch(&key, known, nknown, sizeof *known, path_cmp)) continue;  // replaces an existing file
+        if (*n == *cap) { *cap = *cap ? *cap * 2 : 64; *out = realloc(*out, sizeof **out * *cap); }
+        strlcpy((*out)[*n].rel, r2, sizeof (*out)[*n].rel);
+        strlcpy((*out)[*n].host, h2, sizeof (*out)[*n].host);
+        (*out)[*n].size = (uint64_t)sb.st_size;
+        (*n)++;
+    }
+    closedir(d);
+}
+
+// directory entry offset for "a/b/c", created (with its parents) when missing: entries appended to dm (room
+// reserved by the caller), linked into their parent's list and the directory hash table dh
+static int64_t ensure_dir(uint8_t *dm, uint64_t *dsz, uint8_t *dh, uint32_t dnb, const char *path, int *created) {
+    uint32_t cur = 0;
+    char buf[1024];
+    strlcpy(buf, path, sizeof buf);
+    for (char *tok = strtok(buf, "/"); tok; tok = strtok(NULL, "/")) {
+        uint32_t nl = (uint32_t)strlen(tok), child;
+        memcpy(&child, dm + cur + 8, 4);
+        while (child != 0xFFFFFFFFu && child + 0x18 <= *dsz) {
+            uint32_t cl;
+            memcpy(&cl, dm + child + 0x14, 4);
+            if (cl == nl && !memcmp(dm + child + 0x18, tok, nl)) break;
+            memcpy(&child, dm + child + 4, 4);
+        }
+        if (child == 0xFFFFFFFFu || child + 0x18 > *dsz) {
+            uint32_t at = (uint32_t)*dsz, none = 0xFFFFFFFFu, first, prev, bucket = romfs_hash(cur, tok, nl) % dnb;
+            memcpy(&first, dm + cur + 8, 4);
+            memcpy(&prev, dh + 4 * bucket, 4);
+            uint32_t e[6] = {cur, first, none, none, prev, nl};
+            memcpy(dm + at, e, sizeof e);
+            memset(dm + at + 0x18, 0, (nl + 3) & ~3u);
+            memcpy(dm + at + 0x18, tok, nl);
+            memcpy(dm + cur + 8, &at, 4);
+            memcpy(dh + 4 * bucket, &at, 4);
+            *dsz += 0x18 + ((nl + 3) & ~3u);
+            (*created)++;
+            child = at;
+        }
+        cur = child;
+    }
+    return cur;
+}
+
+// New files (names the game's RomFS doesn't have: a seed's generated dungeon cells, a mod's loose files...). The game
+// parses the RomFS tables itself, so they're extended: copies of the file-meta table (and with new directories, of
+// the directory table) with the new entries appended, linked into their directory's lists and the name hash buckets,
+// are placed past the end of the image; the header and hash tables are patched to match.
+static void add_new_files(const uint64_t *h, const uint8_t *dmeta, uint64_t dsz, uint64_t fsz) {
+    layer_init();
+    if (!nlayers) return;
+    char **known = malloc(sizeof *known * rom_nfiles);
+    for (int i = 0; i < rom_nfiles; i++) known[i] = rom_files[i].path;
+    qsort(known, rom_nfiles, sizeof *known, path_cmp);
+    NewFile *nf = NULL;
+    int n = 0, cap = 0;
+    for (int r = 0; r < nlayers; r++) {
+        int before = n;
+        walk_new(layer_root[r], "", known, rom_nfiles, &nf, &n, &cap);
+        if (r) {  // (a file an earlier layer has already: that one wins)
+            int k = before;
+            for (int i = before; i < n; i++) {
+                bool dup = false;
+                for (int j = 0; j < before && !dup; j++) dup = !strcmp(nf[j].rel, nf[i].rel);
+                if (!dup) nf[k++] = nf[i];
+            }
+            n = k;
+        }
+    }
+    free(known);
+    if (!n) return;
+    rom_files = realloc(rom_files, sizeof(RomFile) * (rom_nfiles + n));
+    uint64_t hoff = h[5], hsz = h[6], dhoff = h[1], dhsz = h[2];
+    uint64_t dcap = dsz;
+    for (int i = 0; i < n; i++) dcap += 0x1C * 16 + strlen(nf[i].rel);  // (room for every directory it could need)
+    uint8_t *dcopy = malloc(dcap), *hcopy = malloc(hsz), *dhcopy = malloc(dhsz), *head = malloc(0x50);
+    memcpy(dcopy, dmeta, dsz);
+    if (base_pread(hcopy, hsz, hoff) != (ssize_t)hsz || base_pread(dhcopy, dhsz, dhoff) != (ssize_t)dhsz ||
+        base_pread(head, 0x50, 0) != 0x50)
+        return;
+    // directories first (the new file entries name them), then the file-meta table to extend: the override-patched
+    // copy if there is one
+    uint64_t dnow = dsz;
+    int dirs = 0;
+    for (int i = 0; i < n; i++) {
+        char dirp[1024];
+        strlcpy(dirp, nf[i].rel, sizeof dirp);
+        char *slash = strrchr(dirp, '/');
+        if (slash) *slash = 0; else dirp[0] = 0;
+        nf[i].dir = (uint32_t)ensure_dir(dcopy, &dnow, dhcopy, (uint32_t)(dhsz / 4), dirp, &dirs);
+    }
+    const uint8_t *base_meta = ov_meta;
+    uint8_t *tmp = NULL;
+    if (!base_meta) { tmp = malloc(fsz); base_pread(tmp, fsz, h[7]); base_meta = tmp; }
+    uint64_t extra = 0;
+    for (int i = 0; i < n; i++) {
+        const char *name = strrchr(nf[i].rel, '/');
+        name = name ? name + 1 : nf[i].rel;
+        extra += 0x20 + ((strlen(name) + 3) & ~3u);
+    }
+    uint64_t nsz = fsz + extra;
+    uint8_t *meta = calloc(1, nsz);
+    memcpy(meta, base_meta, fsz);
+    free(tmp);
+    if (!ov_end) ov_end = (base_size() + 0xF) & ~0xFull;
+    uint64_t meta_at = ov_end;  // the new tables first, then the new files' data
+    uint64_t dmeta_at = (meta_at + nsz + 0xF) & ~0xFull;
+    uint64_t data_at = dirs ? (dmeta_at + dnow + 0xF) & ~0xFull : dmeta_at;
+    uint32_t nb = (uint32_t)(hsz / 4);
+    uint64_t o = fsz;
+    int added = 0;
+    for (int i = 0; i < n; i++) {
+        const char *name = strrchr(nf[i].rel, '/');
+        name = name ? name + 1 : nf[i].rel;
+        uint32_t nl = (uint32_t)strlen(name), d32 = nf[i].dir, entry = (uint32_t)o, child;
+        memcpy(&child, dcopy + d32 + 0xC, 4);  // dir's first file -> becomes our sibling
+        uint64_t rel = data_at - rom_data_off, size = nf[i].size;
+        uint32_t bucket = romfs_hash(d32, name, nl) % nb, prev;
+        memcpy(&prev, hcopy + 4 * bucket, 4);
+        memcpy(meta + o, &d32, 4);
+        memcpy(meta + o + 4, &child, 4);
+        memcpy(meta + o + 8, &rel, 8);
+        memcpy(meta + o + 0x10, &size, 8);
+        memcpy(meta + o + 0x18, &prev, 4);
+        memcpy(meta + o + 0x1C, &nl, 4);
+        memcpy(meta + o + 0x20, name, nl);
+        memcpy(dcopy + d32 + 0xC, &entry, 4);
+        memcpy(hcopy + 4 * bucket, &entry, 4);
+        o += 0x20 + ((nl + 3) & ~3u);
+        if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+        ov[ov_n++] = (Overlay){data_at, size, strdup(nf[i].host), false, NULL};
+        rom_files[rom_nfiles++] = (RomFile){data_at, size, strdup(nf[i].rel), entry};
+        data_at = (data_at + size + 0xF) & ~0xFull;
+        added++;
+    }
+    // the new tables go before the new data (keep the overlay list sorted by start)
+    int tables = dirs ? 2 : 1;
+    if (ov_n + tables > ov_cap) { ov_cap = ov_n + tables + 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+    memmove(ov + (ov_n - added) + tables, ov + (ov_n - added), sizeof *ov * added);
+    ov[ov_n - added] = (Overlay){meta_at, nsz, NULL, false, meta};
+    if (dirs) ov[ov_n - added + 1] = (Overlay){dmeta_at, dnow, NULL, false, dcopy};
+    ov_n += tables;
+    ov_end = data_at;
+    uint64_t fmeta_off = meta_at, fmeta_size = o;
+    memcpy(head + 7 * 8, &fmeta_off, 8);
+    memcpy(head + 8 * 8, &fmeta_size, 8);
+    if (dirs) {
+        memcpy(head + 3 * 8, &dmeta_at, 8);
+        memcpy(head + 4 * 8, &dnow, 8);
+        patches[npatches++] = (Patch){dhoff, dhsz, dhcopy};
+    } else {
+        patches[npatches++] = (Patch){h[3], dsz, dcopy};
+        free(dhcopy);
+    }
+    patches[npatches++] = (Patch){0, 0x50, head};
+    patches[npatches++] = (Patch){hoff, hsz, hcopy};
+    LOG("[fs] %d new romfs files, %d new directories\n", added, dirs);
+}
+
+static int u64_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+
+// Pokémon Z-A: the game's arc/data.trpfd without the layered files (their FNV-1a 64 path hashes) - field 0 of its
+// root table is the files' hashes, field 2 their pack entries (in step) - served in its place
+static void trpfd_unlist(const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
+    RomFile *rf = NULL;
+    for (int i = 0; i < rom_nfiles && !rf; i++) if (!strcmp(rom_files[i].path, "arc/data.trpfd")) rf = &rom_files[i];
+    trinity = rf != NULL;
+    layer_init();
+    if (!rf || !nlayers) return;
+    NewFile *all = NULL;
+    int n = 0, cap = 0;
+    for (int r = 0; r < nlayers; r++) walk_new(layer_root[r], "", NULL, 0, &all, &n, &cap);
+    uint64_t *hs = malloc(sizeof *hs * (n + 1));
+    for (int i = 0; i < n; i++) {
+        uint64_t x = 0xCBF29CE484222645ull;
+        for (const char *p = all[i].rel; *p; p++) x = (x ^ (uint8_t)*p) * 0x100000001B3ull;
+        hs[i] = x;
+    }
+    free(all);
+    qsort(hs, n, sizeof *hs, u64_cmp);
+    uint8_t *d = malloc(rf->size);
+    if (base_pread(d, rf->size, rf->off) != (ssize_t)rf->size) { free(d); free(hs); return; }
+    uint32_t root, f0, f2, n0, n2;
+    int32_t so;
+    memcpy(&root, d, 4);
+    memcpy(&so, d + root, 4);
+    uint32_t vt = root - so;
+    uint16_t fo0, fo2;
+    memcpy(&fo0, d + vt + 4, 2);
+    memcpy(&fo2, d + vt + 8, 2);
+    memcpy(&f0, d + root + fo0, 4);
+    memcpy(&f2, d + root + fo2, 4);
+    uint64_t v0 = root + fo0 + f0, v2 = root + fo2 + f2;
+    memcpy(&n0, d + v0, 4);
+    memcpy(&n2, d + v2, 4);
+    if (n0 != n2) { LOG("[fs] arc/data.trpfd: unexpected layout\n"); free(d); free(hs); return; }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n0; i++) {
+        uint64_t x;
+        memcpy(&x, d + v0 + 4 + 8 * i, 8);
+        if (n && bsearch(&x, hs, n, sizeof *hs, u64_cmp)) continue;
+        uint32_t e;
+        memcpy(&e, d + v2 + 4 + 4 * i, 4);
+        e += 4 * (i - k);  // (the entry moves 4 * (i - k) bytes closer: same target)
+        memcpy(d + v0 + 4 + 8 * k, &x, 8);
+        memcpy(d + v2 + 4 + 4 * k, &e, 4);
+        k++;
+    }
+    free(hs);
+    if (k == n0) { free(d); return; }
+    memcpy(d + v0, &k, 4);
+    memcpy(d + v2, &k, 4);
+    if (!ov_meta) {
+        ov_meta = malloc(fsz);
+        memcpy(ov_meta, fmeta, fsz);
+        ov_meta_off = foff;
+        ov_meta_size = fsz;
+    }
+    if (!ov_end) ov_end = (base_size() + 0xF) & ~0xFull;
+    uint64_t rel = ov_end - rom_data_off;
+    memcpy(ov_meta + rf->meta + 8, &rel, 8);
+    if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+    ov[ov_n++] = (Overlay){ov_end, rf->size, NULL, false, d};
+    ov_end = (ov_end + rf->size + 0xF) & ~0xFull;
+    LOG("[fs] arc/data.trpfd: %u files the mods have taken out of the packs' list\n", n0 - k);
+}
+
+// Button prompts (runtime/hle/pl.c pl_prompt_set): textures/prompts/<style>/romfs.patch, made by
+// tools/za/prompt_textures.py - Pokémon Z-A's icon fonts relabelled, in their pack rebuilt to the same size. "ZAROMFS2",
+// a u32 count, then records (u8 kind = 0, u16 path length, path, u64 offset, u64 length, u64 FNV-1a 64 of the bytes
+// replaced, data): the bytes replace those at that offset in that RomFS file - only when the file has the bytes the
+// record was made for (one patch file covers several game versions; another version's records are left out).
+static void prompt_patch(void) {
+    extern const char *pl_prompt_set(void);
+    const char *set = pl_prompt_set();
+    if (!set) return;
+    char path[128];
+    snprintf(path, sizeof path, "textures/prompts/%s/romfs.patch", set);
+    FILE *f = fopen(path, "rb");
+    if (!f) { LOG("[fs] button prompts: no %s (the start screen makes it: the game's own icon fonts)\n", path); return; }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *d = malloc(len > 0 ? len : 1);
+    bool ok = len > 12 && fread(d, 1, len, f) == (size_t)len && !memcmp(d, "ZAROMFS2", 8);
+    fclose(f);
+    if (!ok) { LOG("[fs] %s: not a patch file\n", path); free(d); return; }
+    uint32_t n;
+    memcpy(&n, d + 8, 4);
+    uint64_t p = 12;
+    int applied = 0;
+    for (uint32_t r = 0; r < n && p + 27 <= (uint64_t)len; r++) {
+        uint16_t pl;
+        memcpy(&pl, d + p + 1, 2);
+        char name[256];
+        snprintf(name, sizeof name, "%.*s", pl, (const char *)d + p + 3);
+        uint64_t off, size, want;
+        memcpy(&off, d + p + 3 + pl, 8);
+        memcpy(&size, d + p + 11 + pl, 8);
+        memcpy(&want, d + p + 19 + pl, 8);
+        const uint8_t *data = d + p + 27 + pl;
+        uint8_t kind = d[p];
+        p += 27 + pl + size;
+        if (p > (uint64_t)len) break;
+        RomFile *rf = NULL;
+        for (int i = 0; i < rom_nfiles && !rf; i++) if (!strcmp(rom_files[i].path, name)) rf = &rom_files[i];
+        if (kind || !rf || off + size > rf->size || npatches == (int)(sizeof patches / sizeof *patches)) {
+            LOG("[fs] %s: %s not patched\n", path, name);
+            continue;
+        }
+        uint8_t *copy = malloc(size);
+        uint64_t have = 0xCBF29CE484222645ull;
+        if (base_pread(copy, size, rf->off + off) == (ssize_t)size)
+            for (uint64_t i = 0; i < size; i++) have = (have ^ copy[i]) * 0x100000001B3ull;
+        if (have != want) { free(copy); continue; }  // (another game version's)
+        memcpy(copy, data, size);
+        patches[npatches++] = (Patch){rf->off + off, size, copy};
+        applied++;
+    }
+    free(d);
+    LOG("[fs] button prompts: %d patches from %s\n", applied, path);
+}
+
+static void rom_index(void) {
+    uint64_t h[10];
+    if (base_pread(h, sizeof h, 0) != (ssize_t)sizeof h) return;
+    // header: size, dir hash (off,size), dir meta (off,size), file hash (off,size), file meta (off,size), data off
+    uint64_t doff = h[3], dsz = h[4], foff = h[7], fsz = h[8];
+    rom_data_off = h[9];
+    // (sizes from the file's own header: a damaged one asking for GBs fails the allocation instead of reading into NULL)
+    uint8_t *dmeta = dsz <= (256u << 20) ? malloc(dsz) : NULL, *fmeta = fsz <= (256u << 20) ? malloc(fsz) : NULL;
+    if (!dmeta || !fmeta || base_pread(dmeta, dsz, doff) != (ssize_t)dsz || base_pread(fmeta, fsz, foff) != (ssize_t)fsz) {
+        LOG("[fs] romfs.bin: unreadable directory / file tables (dir %llu bytes, files %llu bytes)\n",
+            (unsigned long long)dsz, (unsigned long long)fsz);
+        free(dmeta); free(fmeta);
+        return;
+    }
+    int cap = 4096;
+    rom_files = malloc(sizeof(RomFile) * cap);
+    for (uint64_t o = 0; o + 0x20 <= fsz;) {
+        uint32_t parent, namelen;
+        uint64_t data, size;
+        memcpy(&parent, fmeta + o, 4);
+        memcpy(&data, fmeta + o + 8, 8);
+        memcpy(&size, fmeta + o + 0x10, 8);
+        memcpy(&namelen, fmeta + o + 0x1C, 4);
+        char dir[1024], name[256];
+        rom_dir_path(dmeta, (uint32_t)dsz, parent, dir, sizeof dir);
+        uint32_t nl = namelen > 255 ? 255 : namelen;
+        if (nl > fsz - o - 0x20) nl = (uint32_t)(fsz - o - 0x20);  // (a name past the table's end: cut at it)
+        memcpy(name, fmeta + o + 0x20, nl);
+        name[nl] = 0;
+        if (rom_nfiles == cap) { cap *= 2; rom_files = realloc(rom_files, sizeof(RomFile) * cap); }
+        char *path = malloc(strlen(dir) + nl + 1);
+        strcpy(path, dir);
+        strcat(path, name);
+        rom_files[rom_nfiles++] = (RomFile){rom_data_off + data, size, path, (uint32_t)o};
+        o += 0x20 + ((namelen + 3) & ~3u);
+    }
+    // Layered files (mods, a randomizer seed): replacements are served from their folders. The file-meta table is patched
+    // (in a copy) to point them at data appended past the end of the image; reads there go to host files.
+    trpfd_unlist(fmeta, foff, fsz);
+    for (int i = 0; i < rom_nfiles; i++) {
+        char host[1200];
+        if (!layer_file(rom_files[i].path, host, sizeof host)) continue;
+        struct stat sb;
+        if (stat(host, &sb)) continue;
+        if (!ov_meta) {
+            ov_meta = malloc(fsz);
+            memcpy(ov_meta, fmeta, fsz);
+            ov_meta_off = foff;
+            ov_meta_size = fsz;
+            ov_end = (base_size() + 0xF) & ~0xFull;
+        }
+        uint64_t rel = ov_end - rom_data_off, size = (uint64_t)sb.st_size;
+        memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
+        memcpy(ov_meta + rom_files[i].meta + 0x10, &size, 8);
+        if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+        ov[ov_n].start = ov_end;
+        ov[ov_n].size = size;
+        ov[ov_n].path = strdup(host);
+        ov[ov_n].warned = false;
+        ov[ov_n].mem = NULL;
+        ov_n++;
+        ov_end = (ov_end + size + 0xF) & ~0xFull;
+    }
+    if (ov_n) LOG("[fs] %d romfs files replaced (mods / randomizer)\n", ov_n);
+    prompt_patch();
+    if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
+    rt_romfs_files = rom_nfiles;  // (the game's own: before a seed's added files; the crash dialog checks it)
+    add_new_files(h, dmeta, dsz, fsz);
+    // The hidden mod is ignored by the normal Mods scan. Only the opt-in layer
+    // above exposes it, and the game reads its verified, renamed copy in memory.
+    if (xbox_arc) {
+        int replaced = 0;
+        for (int i = 0; i < ov_n; i++)
+            if (ov[i].path && !strcmp(ov[i].path, XBOX_ATTACK_HOST) && ov[i].size == xbox_resource.arc_size) {
+                ov[i].mem = xbox_arc;
+                replaced++;
+            }
+        LOG("[xbox-layout] %d battle resource overlay mounted\n", replaced);
+    }
+    qsort(rom_files, rom_nfiles, sizeof *rom_files, rom_cmp);
+    free(dmeta);
+    free(fmeta);
+    LOG("[fs] romfs index: %d files\n", rom_nfiles);
+}
+
+// Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
+static ssize_t romfs_read(uint8_t *dst, uint64_t size, uint64_t off) {
+    if (!ov_n && !npatches) return base_pread(dst, size, off);
+    uint64_t done = 0;
+    while (done < size) {
+        uint64_t o = off + done, n = size - done;
+        if (ov_n && o >= ov[0].start) {  // appended region
+            int i = 0;
+            while (i < ov_n && !(o >= ov[i].start && o < ov[i].start + ((ov[i].size + 0xF) & ~0xFull))) i++;
+            if (i == ov_n) { memset(dst + done, 0, n); done += n; break; }
+            uint64_t in = o - ov[i].start, avail = ((ov[i].size + 0xF) & ~0xFull) - in;
+            if (n > avail) n = avail;
+            ssize_t r;
+            if (ov[i].mem) {  // in-memory blob (the extended file table)
+                r = in < ov[i].size ? (ssize_t)(n < ov[i].size - in ? n : ov[i].size - in) : 0;
+                memcpy(dst + done, ov[i].mem + in, (size_t)r);
+            } else {
+                uint64_t want = in < ov[i].size ? (n < ov[i].size - in ? n : ov[i].size - in) : 0;
+                r = 0;
+                if (want) {
+                    pthread_mutex_lock(&g_ov_lock);
+                    int fd = ov_file_fd(i);
+                    r = fd < 0 ? -1 : pread(fd, dst + done, want, (off_t)in);
+                    if (fd >= 0 && r != (ssize_t)want && !ov[i].warned) {
+                        LOG("[fs] ERROR: short read of randomizer file %s at %llu (%lld of %llu bytes, %s): zeros "
+                            "there\n", ov[i].path, (unsigned long long)in, (long long)r, (unsigned long long)want,
+                            r < 0 ? strerror(errno) : "file changed?");
+                        ov[i].warned = true;
+                    }
+                    pthread_mutex_unlock(&g_ov_lock);
+                }
+                extern void enemy_random_filter(const char *host, uint64_t off, uint8_t *dst, uint64_t n);
+                if (r > 0) enemy_random_filter(ov[i].path, in, dst + done, (uint64_t)r);  // (enemy mode Random)
+            }
+            if (r < 0) r = 0;
+            if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
+        } else {
+            if (ov_n && o + n > ov[0].start) n = ov[0].start - o;
+            ssize_t r = base_pread(dst + done, n, o);
+            if (r < 0) r = 0;
+            if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
+            // overlay the patched tables (file meta, and with added files: header, dir meta, file hash)
+            for (int k = 0; k < npatches; k++) {
+                uint64_t a = o > patches[k].off ? o : patches[k].off;
+                uint64_t b = o + n < patches[k].off + patches[k].size ? o + n : patches[k].off + patches[k].size;
+                if (a < b) memcpy(dst + done + (a - o), patches[k].data + (a - patches[k].off), b - a);
+            }
+        }
+        done += n;
+    }
+    return (ssize_t)done;
+}
+
+// Path of the RomFS file containing image offset `off` (NULL if none).
+// the RomFS file holding image offset `off` (NULL: none), *base its start (optional)
+static const char *romfs_file_base(uint64_t off, uint64_t *base) {
+    int lo = 0, hi = rom_nfiles - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (off < rom_files[mid].off) hi = mid - 1;
+        else if (off >= rom_files[mid].off + rom_files[mid].size) lo = mid + 1;
+        else { if (base) *base = rom_files[mid].off; return rom_files[mid].path; }
+    }
+    return NULL;
+}
+const char *romfs_file_at(uint64_t off) { return romfs_file_base(off, NULL); }
+
+void romfs_file_read_hook(const char *path);
+
+// The last RomFS reads, for fs_log_recent_reads: #173, "OODLE ERROR : LZ corruption" leaving the lab on 2.0.0. Its
+// first log (a66aa03: the bytes read again from disk) matched our copy of 2.0.0 in all 8 reads it got out before the
+// game's abort cut it short, so the file is sound. Each read now keeps a hash of the bytes as handed to the game, at
+// once (FNV-1a 64 over 8-byte words, ~4 GB/s), and the list is written before anything slow: a hash that differs from
+// the disk's (and our copy's) is a read gone wrong; all the same is data the game's own code then got wrong
+#define RECENT_READS 24
+static struct { uint64_t off, size, addr, hash; int64_t got; } recent_reads[RECENT_READS];
+static unsigned recent_n;
+static pthread_mutex_t recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t fnv_words(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0xCBF29CE484222645ull, w;
+    uint64_t k = 0;
+    for (; k + 8 <= n; k += 8) { memcpy(&w, p + k, 8); h = (h ^ w) * 0x100000001B3ull; }
+    for (; k < n; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+    return h;
+}
+static void recent_read_note(uint64_t off, uint64_t size, const uint8_t *dst, ssize_t got) {
+    uint64_t h = got > 0 ? fnv_words(dst, (uint64_t)got) : 0;
+    pthread_mutex_lock(&recent_lock);
+    unsigned i = recent_n++ % RECENT_READS;
+    recent_reads[i].off = off, recent_reads[i].size = size, recent_reads[i].addr = (uint64_t)(uintptr_t)dst;
+    recent_reads[i].hash = h, recent_reads[i].got = got;
+    pthread_mutex_unlock(&recent_lock);
+}
+// The game's one OodleLZ_Decompress call for its archive reads (FileLoaderFromArchive: f_7001a9bd38 on 2.0.0,
+// f_7001a9b718 on 2.0.2 - serial, threadPhase 3, with a 512 KB decoder memory kept in the thread's TLS), through
+// tools/za_patches.py OODLE_CALL: a decode that returns 0 for data whose bytes are right is decoded again. #173 #206
+// (Windows 11 build 26300 only): the bytes read were the file's own and still intact in memory, yet the decode
+// failed while two of the game's worker threads crashed together - something else wrote into the decoder's state at
+// that moment, and the same bytes decode fine here every time. A retry gets a clean run instead of the svcBreak that
+// ended the session. The arguments (x0-x7 and the 6 on the stack: sp + 0 .. 0x2f) are restored for each try.
+// #233 (v0.1.21, Windows 11 26200, RTX 2080 S): both retries of the same block (71548 bytes from 33445, as #223)
+// failed too - so what went wrong stays wrong between tries: the compressed bytes themselves, or the decoder memory.
+// Each retry now runs with decoder memory of its own (the 12th argument, sp + 0x18: a fresh host block - guest
+// addresses are host addresses), and when the compressed bytes changed during the failed decode (hashed before it)
+// and they came in one of the last RomFS reads, they are read from the disk again first.
+// LARECOMP_OODLE_RETRY=<n> tries after the first (default 2, 0 off). Log: "[oodle] decode failed ... retry n: ok".
+// the compressed bytes at [src, src + n) inside one of the last reads: read again from the RomFS (1), else 0
+static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size);
+
+// The block decoded outside the game: oodec (third_party/ooz/oodec.cpp, a separate GPLv3 program shipped in
+// zaprompts/ next to ooz - ZA Recomp only runs it, as it does zaprompts) on the same compressed bytes. #248 (v0.1.22):
+// the game's decode of the block leaving the lab (71548 bytes from 33445) still failed with the compressed bytes
+// unchanged and intact (as read from the disk) and decoder memory of its own, on the players' PCs only - while ooz
+// decodes those very bytes right. So whatever goes wrong is inside the game's run of the decoder there, and a decoder
+// that isn't the game's gets the block anyway. Returns the bytes written to dst (raw), or 0 (logged why).
+static uint64_t oodle_native(uint64_t src, uint64_t n, uint64_t dst, uint64_t raw) {
+    char tool[1100];
+    if (!rt_resource("zaprompts/oodec" PLAT_EXE_SUFFIX, "build/ooz/oodec" PLAT_EXE_SUFFIX, tool, sizeof tool)) {
+        LOG("[oodle] no oodec program (zaprompts/oodec" PLAT_EXE_SUFFIX "): the block can't be decoded outside the game\n");
+        return 0;
+    }
+    static _Atomic unsigned seq;
+    unsigned k = ++seq;
+    char in[64], out[64], size[32];
+    mkdir("cache", 0755);
+    snprintf(in, sizeof in, "cache/oodle-%u.in", k);
+    snprintf(out, sizeof out, "cache/oodle-%u.out", k);
+    snprintf(size, sizeof size, "%llu", (unsigned long long)raw);
+    uint64_t r = 0;
+    FILE *f = fopen(in, "wb");
+    bool wrote = f && fwrite((const void *)(uintptr_t)src, 1, (size_t)n, f) == n;
+    if (f) fclose(f);
+    if (wrote) {
+        const char *argv[] = {tool, in, out, size, NULL};
+        uint64_t t0 = plat_now_ns();
+        PlatProc p = plat_spawn(argv, "cache/oodle.log", true);
+        int code = p ? plat_proc_wait(p, true) : -1;
+        f = code == 0 ? fopen(out, "rb") : NULL;
+        if (f) {
+            uint8_t *tmp = malloc((size_t)raw);  // (all or nothing into the game's buffer)
+            if (tmp && fread(tmp, 1, (size_t)raw, f) == raw) memcpy((void *)(uintptr_t)dst, tmp, (size_t)raw), r = raw;
+            free(tmp);
+            fclose(f);
+        }
+        LOG("[oodle] decoded outside the game (oodec, %llu ms): %s\n", (unsigned long long)((plat_now_ns() - t0) / 1000000),
+            r ? "ok" : code == 1 ? "it can't decode these bytes either" : "it didn't run (cache/oodle.log)");
+    } else
+        LOG("[oodle] can't write %s for oodec\n", in);
+    remove(in), remove(out);
+    return r;
+}
+void rt_za_oodle_call(Cpu *c, uint64_t target) {
+    static int tries = -1;
+    if (tries < 0) { const char *e = getenv("LARECOMP_OODLE_RETRY"); tries = e ? atoi(e) : 2; }
+    GuestFn fn = dispatch_lookup(target);
+    uint64_t x[8], st[6], lr = c->x[30];
+    memcpy(x, c->x, sizeof x);
+    for (int i = 0; i < 6; i++) st[i] = LD64(c->sp + 8 * (uint64_t)i);
+    bool hashed = tries > 0 && x[0] && x[1] && x[1] <= (64u << 20);
+    uint64_t h0 = hashed ? fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]) : 0;
+    fn(c);
+    {   // LARECOMP_TEST_OODLE_FAIL=<n> (test): every n-th decode reads as failed once - the retry path, on real data
+        static long every = -1, calls;
+        if (every < 0) { const char *e = getenv("LARECOMP_TEST_OODLE_FAIL"); every = e ? atol(e) : 0; }
+        if (every > 0 && ++calls % every == 0) LOG("[oodle] test: decode %ld made to fail\n", calls), c->x[0] = 0;
+    }
+    uint8_t *own = NULL, *own_raw = NULL;  // (the retries' decoder memory: 64-byte aligned, as the game's)
+    uint64_t mem_size = st[4];
+    if (c->x[0] == 0 && x[3] != 0 && tries > 0 && st[3] && mem_size && mem_size <= (64u << 20)) {
+        own_raw = malloc((size_t)mem_size + 64);
+        if (own_raw) own = (uint8_t *)(((uintptr_t)own_raw + 63) & ~(uintptr_t)63), memset(own, 0, (size_t)mem_size);
+    }
+    for (int t = 1; t <= tries && c->x[0] == 0 && x[3] != 0; t++) {
+        char what[160] = "not hashed";
+        if (hashed) {
+            uint64_t h1 = fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]);
+            if (h1 == h0) snprintf(what, sizeof what, "compressed bytes unchanged");
+            else {
+                char rd[120] = "";
+                int r = recent_read_restore(x[0], x[1], rd, sizeof rd);
+                snprintf(what, sizeof what, "compressed bytes CHANGED during the decode, %s", rd);
+                if (r) h0 = fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]);
+            }
+        }
+        LOG("[oodle] decode failed (%llu bytes from %llu at %llx; %s; decoder memory %llx +%llx): retry %d%s\n",
+            (unsigned long long)x[3], (unsigned long long)x[1], (unsigned long long)x[0], what,
+            (unsigned long long)st[3], (unsigned long long)mem_size, t, own ? " with decoder memory of its own" : "");
+        memcpy(c->x, x, sizeof x);
+        for (int i = 0; i < 6; i++) ST64(c->sp + 8 * (uint64_t)i, i == 3 && own ? (uint64_t)(uintptr_t)own : st[i]);
+        c->x[30] = lr;
+        fn(c);
+        if (c->x[0] != 0) {
+            LOG("[oodle] retry %d: ok (%llu bytes)\n", t, (unsigned long long)c->x[0]);
+            rt_game_data_bad = false;  // (the data was fine after all: a crash later isn't about it)
+        }
+    }
+    if (own) ST64(c->sp + 0x18, st[3]);  // (the caller's own argument back)
+    free(own_raw);
+    // Still failed: the block decoded outside the game (oodle_native, #248). LARECOMP_OODLE_NATIVE=0 off.
+    // (test) LARECOMP_TEST_OODLE_FAIL with LARECOMP_OODLE_RETRY=0: every forced failure lands here on a block the game
+    // did decode, and oodec's bytes are compared with the game's - "[oodle] test: ... the same" / "DIFFER"
+    static int native = -1;
+    if (native < 0) { const char *e = getenv("LARECOMP_OODLE_NATIVE"); native = !e || atoi(e) != 0; }
+    if (c->x[0] == 0 && x[3] != 0 && native && x[0] && x[1] && x[1] <= (64u << 20) && x[2] && x[3] <= (256u << 20)) {
+        static long every = -1;
+        if (every < 0) { const char *e = getenv("LARECOMP_TEST_OODLE_FAIL"); every = e ? atol(e) : 0; }
+        uint8_t *game = NULL;
+        if (every > 0 && (game = malloc((size_t)x[3]))) memcpy(game, (const void *)(uintptr_t)x[2], (size_t)x[3]);
+        uint64_t r = oodle_native(x[0], x[1], x[2], x[3]);
+        if (game) {
+            bool same = r == x[3] && !memcmp(game, (const void *)(uintptr_t)x[2], (size_t)x[3]);
+            LOG("[oodle] test: oodec's %llu bytes against the game's own decode: %s\n", (unsigned long long)x[3],
+                same ? "the same" : "DIFFER");
+            free(game);
+        }
+        if (r) {
+            memcpy(c->x, x, sizeof x);  // (the call's result: the bytes decoded, as OodleLZ_Decompress returns)
+            c->x[0] = r, c->x[30] = lr;
+            rt_game_data_bad = false;
+        }
+    }
+}
+
+static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size) {
+    pthread_mutex_lock(&recent_lock);
+    unsigned k = recent_n < RECENT_READS ? recent_n : RECENT_READS;
+    typeof(recent_reads[0]) r[RECENT_READS];
+    for (unsigned i = 0; i < k; i++) r[i] = recent_reads[(recent_n - k + i) % RECENT_READS];
+    pthread_mutex_unlock(&recent_lock);
+    for (int i = (int)k - 1; i >= 0; i--) {  // (the newest read holding them)
+        if (r[i].got <= 0 || src < r[i].addr || src + n > r[i].addr + (uint64_t)r[i].got) continue;
+        uint64_t off = r[i].off + (src - r[i].addr);
+        ssize_t got = romfs_read((uint8_t *)(uintptr_t)src, n, off);
+        snprintf(what, what_size, "read again from the RomFS at %llx (%lld of %llu bytes)", (unsigned long long)off,
+                 (long long)got, (unsigned long long)n);
+        return got == (ssize_t)n;
+    }
+    snprintf(what, what_size, "not in the last %u RomFS reads", k);
+    return 0;
+}
+
+void fs_log_recent_reads(void) {  // (services/am.c: the game's decompressor said its data is damaged)
+    pthread_mutex_lock(&recent_lock);
+    unsigned n = recent_n < RECENT_READS ? recent_n : RECENT_READS;
+    typeof(recent_reads[0]) r[RECENT_READS];
+    for (unsigned i = 0; i < n; i++) r[i] = recent_reads[(recent_n - n + i) % RECENT_READS];
+    pthread_mutex_unlock(&recent_lock);
+    LOG("[fs] the last %u RomFS reads before the damaged data (file, offset in it, size, bytes read if short, FNV-1a 64 "
+        "by 8-byte words of the bytes handed to the game; romfs.bin %llu bytes):\n", n, (unsigned long long)base_size());
+    for (unsigned i = 0; i < n; i++) {  // (first, all at once: the game aborts soon after its error)
+        uint64_t base = 0;
+        const char *path = romfs_file_base(r[i].off, &base);
+        char sh[48] = "";
+        if ((uint64_t)r[i].got != r[i].size) snprintf(sh, sizeof sh, " (SHORT READ: %lld)", (long long)r[i].got);
+        LOG("[fs]   %s +%llx %llx%s %016llx\n", path ? path : "?", (unsigned long long)(r[i].off - base),
+            (unsigned long long)r[i].size, sh, (unsigned long long)r[i].hash);
+    }
+    uint8_t *buf = NULL;  // (then the same bytes read again from disk: another hash = the first read went wrong)
+    for (unsigned i = n; i-- > 0;) {
+        uint64_t sz = r[i].got > 0 ? (uint64_t)r[i].got : 0;
+        if (sz > (64ull << 20) || !(buf = realloc(buf, sz ? sz : 1)) || romfs_read(buf, sz, r[i].off) != (ssize_t)sz) continue;
+        uint64_t h = fnv_words(buf, sz);
+        LOG("[fs]   read again +%llx (image): %s\n", (unsigned long long)r[i].off,
+            h == r[i].hash ? "the same" : "DIFFERENT - the read the game got was wrong");
+    }
+    free(buf);
+    // (#206 #173: every read "the same", and the compressed bytes at the decompressor's entry matched the disk too, yet
+    // the game's Oodle decoder failed - on two PCs, both Windows 11 build 26300, never here on Windows 10 with the same
+    // save, data and game code. So also: is each buffer the game read into still mapped, and does it still hold what
+    // was read - a page decommitted or overwritten under the decoder (memory) vs everything intact (a race between the
+    // game's threads, or the decoder's own computation). A page that isn't committed isn't touched: reading it would
+    // commit a zero page and change what we look at.)
+    extern int kernel_live_threads(void);
+    LOG("[fs] the game's buffers now (last reads first; %d guest threads running):\n", kernel_live_threads());
+    for (unsigned i = n, k = 0; i-- > 0 && k < 8; k++) {
+        uint64_t a = r[i].addr, sz = r[i].got > 0 ? (uint64_t)r[i].got : 0;
+        char s0[160] = "?", s1[160] = "?";
+        bool known0 = plat_page_state(a, s0, sizeof s0), known1 = sz && plat_page_state(a + sz - 1, s1, sizeof s1);
+        bool readable = !known0 || (strstr(s0, "committed") && (!known1 || strstr(s1, "committed")));
+        const char *now = !sz ? "nothing read" : !readable ? "NOT COMMITTED - not read (left as it is)"
+                        : fnv_words((const uint8_t *)(uintptr_t)a, sz) == r[i].hash ? "still as read"
+                        : "CHANGED since the read (overwritten, or reused for something else)";
+        LOG("[fs]   +%llx at %llx (%llx bytes): first page %s; last page %s; contents %s\n", (unsigned long long)r[i].off,
+            (unsigned long long)a, (unsigned long long)sz, known0 ? s0 : "state unknown here", known1 ? s1 : "-", now);
+    }
+}
+
+// ------------------------------------------------------------------ IStorage (raw RomFS image)
+typedef struct { uint64_t size; int fd; } Storage;  // (fd: add-on content, plain_storage - the RomFS image reads through base_pread)
+
+static void storage(Service *s, IpcReq *req, IpcResp *resp) {
+    Storage *st = s->state;
+    switch (req->cmd) {
+    case 0: {  // Read(offset, size) -> B buffer
+        uint64_t off = IN(uint64_t, 0), size = IN(uint64_t, 8);
+        IpcBuf *b = out_buf(req, 0);
+        if (!b) { resp->result = MAKE_RESULT(2, 6001); break; }
+        if (size > b->size) size = b->size;
+        uint64_t t0 = plat_now_ns();
+        ssize_t n = romfs_read((uint8_t *)(uintptr_t)b->addr, size, off);
+        uint64_t t1 = plat_now_ns();
+        recent_read_note(off, size, (const uint8_t *)(uintptr_t)b->addr, n);
+        {   // (test) LARECOMP_FS_RECENT_AT=<n>: fs_log_recent_reads after the n-th read, as on the game's Oodle error
+            static long at = -1;
+            if (at < 0) at = getenv("LARECOMP_FS_RECENT_AT") ? atol(getenv("LARECOMP_FS_RECENT_AT")) : 0;
+            if (at > 0 && recent_n == (unsigned)at) fs_log_recent_reads();
+        }
+        if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
+        {   // (test) LARECOMP_FS_MBPS=<MB/s>: each read takes as long as at that speed (the console's storage: tens of MB/s;
+            // ours is instant, which may expose races in the game's streaming)
+            static double mbps = -1;
+            if (mbps < 0) mbps = getenv("LARECOMP_FS_MBPS") ? atof(getenv("LARECOMP_FS_MBPS")) : 0;
+            if (mbps > 0 && n > 0)
+                for (double us = (double)n / (mbps * 1048576.0) * 1e6; us > 0; us -= 500000) usleep(us > 500000 ? 500000 : (useconds_t)us);
+        }
+        {   // (debug) LARECOMP_LOG_READS=<file>: every read as "<RomFS path> <offset in the file> <size> <ms since the
+            // first read> <us it took>"
+            static FILE *rf;
+            static int on = -1;
+            static uint64_t start;
+            if (on < 0) { const char *e = getenv("LARECOMP_LOG_READS"); on = e && (rf = fopen(e, "w")) != NULL; }
+            if (on) {
+                uint64_t base = 0;
+                const char *path = romfs_file_base(off, &base);
+                if (!start) start = t0;
+                fprintf(rf, "%s %llx %llx %llu %llu\n", path ? path : "?", (unsigned long long)(off - base), (unsigned long long)size,
+                        (unsigned long long)((t0 - start) / 1000000), (unsigned long long)((t1 - t0) / 1000));
+                fflush(rf);
+            }
+        }
+        {
+            const char *path = romfs_file_at(off);
+            static const char *last;
+            if (path && path != last) {
+                last = path;
+                if (getenv("LARECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
+                romfs_file_read_hook(path);
+            }
+        }
+        static uint64_t reads, bytes;
+        reads++;
+        bytes += size;
+        if ((reads & (reads - 1)) == 0) LOG("[fs] romfs reads: %llu (%llu KB)\n", reads, bytes >> 10);
+        break;
+    }
+    case 4: OUT(uint64_t, 0) = ov_n ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize
+    default: LOG("[fs] IStorage cmd %u (ok)\n", req->cmd);
+    }
+}
+
+// a plain storage: a host file's bytes (add-on content)
+static void plain_storage(Service *s, IpcReq *req, IpcResp *resp) {
+    Storage *st = s->state;
+    switch (req->cmd) {
+    case 0: {  // Read(offset, size) -> B buffer
+        uint64_t off = IN(uint64_t, 0), size = IN(uint64_t, 8);
+        IpcBuf *b = out_buf(req, 0);
+        if (!b) { resp->result = MAKE_RESULT(2, 6001); break; }
+        if (size > b->size) size = b->size;
+        ssize_t n = pread(st->fd, (uint8_t *)(uintptr_t)b->addr, size, (off_t)off);
+        if (n < 0) n = 0;
+        if ((uint64_t)n < size) memset((uint8_t *)(uintptr_t)b->addr + n, 0, size - n);
+        break;
+    }
+    case 4: OUT(uint64_t, 0) = st->size; resp_size(resp, 8); break;  // GetSize
+    default: LOG("[fs] IStorage(aoc) cmd %u (ok)\n", req->cmd);
+    }
+}
+
+static Service *open_romfs_storage(void) {
+    if (!g_base_open) {
+        base_open();
+        rom_index();
+    }
+    Storage *st = calloc(1, sizeof *st);
+    st->size = base_size();
+    return service_new("IStorage(romfs)", storage, st);
+}
+
+// ------------------------------------------------------------------ host-directory filesystem
+// Save data is all-or-nothing, as on the Switch (its save storage commits a mount's changes at once): a file opened
+// for writing on a save mount works on a copy, <file>.pending, which the mount's Commit syncs and renames over the
+// file - so a crash or power loss mid-save leaves the last committed save, never a half-written one (the save
+// backups PR #55 was closed in favour of this). Reads see the pending copy, as the Switch's do before a commit. A
+// copy left by a crash is dropped at the next mount (uncommitted, as on the Switch). The SD card mount writes in place.
+// A save that can't be written (save folder not writable, disk full, ...) is dropped whole and the committed save
+// stays as it was, but the game is never told: its SDK aborts on any failed OpenFile / Write / Flush / Commit (the
+// crash dialog), and it has no "could not save" path anyway. The player gets one warning (save_failed) instead.
+#define PENDING_MAX 16
+typedef struct {
+    char root[1024];
+    bool journaled;
+    int npending;
+    char pending[PENDING_MAX][1100];
+    bool failed[PENDING_MAX];  // a write to this working copy failed: dropped at the Commit, never published
+    bool live;                 // a journaled mount the game hasn't closed yet (g_mount_lock)
+} HostFs;
+// The game mounts the save folder for each save. A new mount drops the working copies a crash left behind - but
+// never while another mount of the same folder is still open: those could be its copies, mid-save.
+static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LIVE_MOUNTS_MAX 16
+static HostFs *g_live_mounts[LIVE_MOUNTS_MAX];
+static void mounts_reset(void) {
+    pthread_mutex_lock(&g_mount_lock);
+    memset(g_live_mounts, 0, sizeof g_live_mounts);
+    pthread_mutex_unlock(&g_mount_lock);
+}
+typedef struct {
+    int fd;
+    char path[1100];
+    HostFs *fs;    // a save file opened for writing (journaled mount), else NULL
+    int slot;      // its working copy in fs->pending (-1: a scratch copy)
+    bool scratch;  // staging failed: the writes go to a temporary file outside the save folder, never committed
+    bool dropped;  // no scratch copy either: the writes are dropped (fd: the committed file read-only, or -1)
+} HostFile;
+
+// Saving failed: say so loudly in the log, and once per run in a dialog (the game itself still says "Game saved").
+static void save_failed(HostFs *fs, const char *what, const char *path, int error) {
+    LOG("[save] SAVE FAILED: %s %s (%s) - not saved, the last committed save is kept\n", what, path,
+        error ? strerror(error) : "earlier error");
+    static bool told;
+    if (told) return;
+    told = true;
+    char text[1400];
+    snprintf(text, sizeof text, "Your game could not be saved (the game may still say it was). Your previous save "
+             "is unchanged.\n\nMake sure this folder can be written to and the disk has free space:\n%s", fs->root);
+    plat_notice(text);
+}
+
+static void sync_dir_of(const char *path) {
+    char d[1100];
+    snprintf(d, sizeof d, "%s", path);
+    char *slash = strrchr(d, '/');
+    if (!slash) return;
+    *slash = 0;
+#ifndef _WIN32
+    int fd = open(d, O_RDONLY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+#endif
+}
+
+// the working copy over the file in one step (Windows' rename doesn't replace an existing file; with the UTF-8
+// code page the A function takes our paths as they are)
+static int replace_file(const char *from, const char *to) {
+#ifdef _WIN32
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+    LOG("[save] replace %s failed (Windows error %lu)\n", to, (unsigned long)GetLastError());
+    errno = EIO;
+    return -1;
+#else
+    return rename(from, to);
+#endif
+}
+
+// in -> out from the start (errno set on failure)
+static bool copy_fd(int in, int out) {
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof buf)) > 0)
+        for (ssize_t done = 0; done < n;) {
+            ssize_t w = write(out, buf + done, (size_t)(n - done));
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) { if (!w) errno = EIO; return false; }
+            done += w;
+        }
+    return n == 0;
+}
+
+static bool copy_file(const char *from, const char *to) {
+    int in = open(from, O_RDONLY);
+    if (in < 0) return false;
+    int out = open(to, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    bool ok = out >= 0 && copy_fd(in, out);
+    int error = errno;
+    close(in);
+    if (out >= 0 && close(out)) { error = errno; ok = false; }
+    errno = error;
+    return ok;
+}
+
+// A copy of the save file outside the save folder, deleted when closed: what the game writes when its working copy
+// can't be made. Writing over the committed file instead would put the only copy at risk (a crash, a full disk or a
+// failed write mid-save leaves it half-written, and a rando slot's flags sidecar would no longer match it).
+static int scratch_copy(const char *from) {
+    int in = open(from, O_RDONLY);
+    if (in < 0) return -1;
+#ifdef _WIN32
+    char dir[MAX_PATH], name[MAX_PATH];
+    int fd = -1;
+    if (GetTempPathA(sizeof dir, dir) && GetTempFileNameA(dir, "las", 0, name))
+        fd = _open(name, _O_RDWR | _O_BINARY | _O_TEMPORARY);
+#else
+    char name[1100];
+    const char *dir = getenv("TMPDIR");
+    snprintf(name, sizeof name, "%s/lasrecomp-save-XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(name);
+    if (fd >= 0) unlink(name);
+#endif
+    if (fd >= 0 && !copy_fd(in, fd)) { close(fd); fd = -1; }
+    close(in);
+    return fd;
+}
+
+// the working copy of a save file (made on its first open for writing): its index in fs->pending; -1 for the SD
+// card mount, a file not being saved, or (errno set) when the copy can't be made
+static int pending_of(HostFs *fs, const char *p, bool create, char *out, size_t n) {
+    if (!fs->journaled) return -1;
+    snprintf(out, n, "%s.pending", p);
+    for (int i = 0; i < fs->npending; i++) if (!strcmp(fs->pending[i], p)) return i;
+    if (!create) return -1;
+    if (fs->npending == PENDING_MAX) { errno = ENOSPC; return -1; }
+    if (strlen(p) >= sizeof fs->pending[0]) { errno = ENAMETOOLONG; return -1; }
+    if (!copy_file(p, out)) { int error = errno; unlink(out); errno = error; return -1; }
+    fs->failed[fs->npending] = false;
+    snprintf(fs->pending[fs->npending], sizeof fs->pending[0], "%s", p);
+    return fs->npending++;
+}
+
+static bool sync_save_file(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    int error = errno;
+    if (close(fd)) return false;
+    if (!ok) errno = error;
+    return ok;
+}
+static bool commit_slot(const char *path) {
+    char pending[1200], flags[1200], flags_pending[1200];
+    snprintf(pending, sizeof pending, "%s.pending", path);
+    snprintf(flags, sizeof flags, "%s.flagsx", path);
+    snprintf(flags_pending, sizeof flags_pending, "%s.flagsx.pending", path);
+    struct stat st;
+    bool has_flags = stat(flags_pending, &st) == 0;
+    if (!has_flags && errno != ENOENT) return false;
+    if (has_flags && !sync_save_file(flags_pending)) return false;
+    if (!stat(pending, &st)) {
+        if (!sync_save_file(pending) || replace_file(pending, path)) return false;
+        sync_dir_of(path);
+    } else if (errno != ENOENT || !has_flags) return false;
+    // A missing working copy with pending flags means the data rename already succeeded. Finish that pair
+    // on retry; never discard its flags or let a fresh mount read the new data with the old flags.
+    if (has_flags) {
+        if (replace_file(flags_pending, flags)) return false;
+        sync_dir_of(flags);
+    }
+    return true;
+}
+// a save that won't be committed: its working copies go (the committed file and sidecar stay as they are)
+static void drop_slot(const char *path) {
+    char pending[1200], flags_pending[1250];
+    snprintf(pending, sizeof pending, "%s.pending", path);
+    snprintf(flags_pending, sizeof flags_pending, "%s.flagsx.pending", path);
+    unlink(pending);
+    unlink(flags_pending);
+}
+// Commit always succeeds for the game (see save_failed). A save that failed is dropped whole. If only the sidecar's
+// rename failed (the data is already replaced), its working copy stays for the next mount to finish the pair.
+static void commit(HostFs *fs) {
+    extern void pace_hitch(const char *why);  // nvn/pace.c
+    if (fs->npending) pace_hitch("a save commit");
+    for (int i = 0; i < fs->npending; i++) {
+        const char *path = fs->pending[i];
+        if (fs->failed[i]) {
+            drop_slot(path);
+            save_failed(fs, "dropped the failed save", path, 0);
+        } else if (!commit_slot(path)) {
+            int error = errno;
+            char pending[1200];
+            struct stat st;
+            snprintf(pending, sizeof pending, "%s.pending", path);
+            if (!stat(pending, &st)) {
+                drop_slot(path);
+                save_failed(fs, "could not commit", path, error);
+            } else LOG("[save] committed %s, but not its flags sidecar yet (%s): the next mount finishes it\n", path,
+                       strerror(error));
+        } else LOG("[save] committed %s\n", path);
+    }
+    fs->npending = 0;
+}
+// Recover pairs before dropping abandoned working copies: deleting the data copy first would make an
+// uncommitted sidecar look committed. No format change: existing .flagsx files still contain just flag bytes.
+static bool recover_save_flags(const char *root) {
+    DIR *d = opendir(root);
+    if (!d) return false;
+    struct dirent *e;
+    int error = 0;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n <= 15 || strcmp(e->d_name + n - 15, ".flagsx.pending")) continue;
+        char path[1200], pending[1250], flags_pending[1250];
+        snprintf(path, sizeof path, "%s/%.*s", root, (int)(n - 15), e->d_name);
+        snprintf(pending, sizeof pending, "%s.pending", path);
+        snprintf(flags_pending, sizeof flags_pending, "%s.flagsx.pending", path);
+        struct stat st;
+        if (!stat(pending, &st)) {
+            if (unlink(flags_pending)) { error = errno; break; }
+        } else if (errno != ENOENT || !commit_slot(path)) { error = errno; break; }
+    }
+    closedir(d);
+    if (error) errno = error;
+    return !error;
+}
+typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
+
+// The game closed the mount. (Its HostFs stays allocated: a file opened on it may still point at it.)
+static void fs_unmount(Service *s) {
+    HostFs *fs = s->state;
+    pthread_mutex_lock(&g_mount_lock);
+    for (int i = 0; fs && i < LIVE_MOUNTS_MAX; i++) if (g_live_mounts[i] == fs) g_live_mounts[i] = NULL;
+    if (fs) fs->live = false;
+    pthread_mutex_unlock(&g_mount_lock);
+}
+
+// The game closed the file / directory: close the host one too. They used to stay open for the whole run - a leak
+// everywhere, and on Windows the open working copy blocked the Commit's replace, so saves never landed (a file can't
+// be replaced while it's open there; the game closes its files before it commits, as nn::fs requires).
+static void file_close(Service *s) {
+    HostFile *f = s->state;
+    if (f) { if (f->fd >= 0) close(f->fd); free(f); s->state = NULL; }
+}
+static void dir_close(Service *s) {
+    HostDir *d = s->state;
+    if (d) { if (d->d) closedir(d->d); free(d); s->state = NULL; }
+}
+
+static const char *in_path(IpcReq *req, int i) {
+    if (i < req->nx) return (const char *)(uintptr_t)req->x[i].addr;
+    if (i < req->na) return (const char *)(uintptr_t)req->a[i].addr;
+    return "";
+}
+
+static void host_path(HostFs *fs, const char *p, char *out, size_t n) {
+    snprintf(out, n, "%s%s%s", fs->root, p[0] == '/' ? "" : "/", p);
+}
+
+static uint32_t errno_result(void) {
+    if (errno == ENOENT || errno == ENOTDIR) return FS_PATH_NOT_FOUND;
+    if (errno == EEXIST) return FS_PATH_EXISTS;
+    if (errno == ENOTEMPTY) return FS_NOT_EMPTY;
+    LOG("[fs] host error %d (%s): result 2002-4000\n", errno, strerror(errno));  // (the game aborts on it)
+    return MAKE_RESULT(2, 4000);
+}
+
+// a save file's write / flush / resize failed: that save is dropped at the Commit (the game is told it worked)
+static void file_failed(HostFile *f, const char *what, int error) {
+    if (f->slot >= 0) f->fs->failed[f->slot] = true;
+    save_failed(f->fs, what, f->path, error);
+}
+
+static void file(Service *s, IpcReq *req, IpcResp *resp) {
+    HostFile *f = s->state;
+    switch (req->cmd) {
+    case 0: {  // Read(option, offset, size) -> B
+        int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
+        IpcBuf *b = out_buf(req, 0);
+        if (!b || off < 0 || size < 0) { resp->result = MAKE_RESULT(2, 6001); break; }
+        if ((uint64_t)size > b->size) size = (int64_t)b->size;
+        if (f->dropped && f->fd < 0) { OUT(int64_t, 0) = 0; resp_size(resp, 8); break; }  // (nothing open: empty)
+        ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
+        if (n < 0) resp->result = errno_result();
+        if (n > 0 && !f->scratch && strstr(f->path, "savedata")) {
+            LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
+            extern void save_editor_file_read(const char *path, uint64_t addr, int64_t off, int64_t size);
+            save_editor_file_read(f->path, b->addr, off, n);
+            extern void flags_ext_save_read(const char *path, uint64_t addr, int64_t off, int64_t size);
+            flags_ext_save_read(f->path, b->addr, off, n);
+        }
+        OUT(int64_t, 0) = n < 0 ? 0 : n;
+        resp_size(resp, 8);
+        break;
+    }
+    case 1: {  // Write(option, offset, size) <- A
+        int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
+        IpcBuf *a = in_buf(req, 0);
+        if (strstr(f->path, "savedata"))
+            LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
+        if (f->dropped) break;  // (reported when it was opened; the game is never told, see save_failed)
+        int error = 0;
+        for (int64_t done = 0; done < size;) {  // (a short write goes on from where it stopped)
+            ssize_t n = pwrite(f->fd, (void *)(uintptr_t)(a->addr + done), (size_t)(size - done), off + done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { error = n ? errno : EIO; break; }
+            done += n;
+        }
+        if (!error && !f->scratch && strstr(f->path, "savedata")) {
+            extern bool flags_ext_save_written(const char *path, uint64_t addr, int64_t off, int64_t size);
+            errno = 0;
+            if (!flags_ext_save_written(f->path, a->addr, off, size)) error = errno ? errno : EIO;
+        }
+        if (error && f->fs) file_failed(f, "write", error);
+        else if (error) { errno = error; resp->result = errno_result(); }
+        break;
+    }
+    case 2:  // Flush
+        if (f->dropped) break;
+        if (fsync(f->fd) && f->fs) file_failed(f, "flush", errno);
+        break;
+    case 3:  // SetSize
+        if (f->dropped) break;
+        if (!ftruncate(f->fd, IN(int64_t, 0))) break;
+        if (f->fs) file_failed(f, "resize", errno);
+        else resp->result = errno_result();
+        break;
+    case 4: {
+        struct stat sb;
+        OUT(int64_t, 0) = f->fd >= 0 && !fstat(f->fd, &sb) ? sb.st_size : 0;
+        resp_size(resp, 8);
+        break;
+    }
+    default: LOG("[fs] IFile cmd %u (ok)\n", req->cmd);
+    }
+}
+
+static void directory(Service *s, IpcReq *req, IpcResp *resp) {
+    HostDir *d = s->state;
+    switch (req->cmd) {
+    case 0: {  // Read -> B buffer of 0x310-byte entries
+        IpcBuf *b = out_buf(req, 0);
+        uint8_t *out = (uint8_t *)(uintptr_t)b->addr;
+        int64_t max = (int64_t)(b->size / 0x310), n = 0;
+        struct dirent *e;
+        while (n < max && (e = readdir(d->d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+#ifdef _WIN32  // no d_type
+            char full[2048];
+            struct stat es;
+            snprintf(full, sizeof full, "%s/%s", d->path, e->d_name);
+            bool isdir = !stat(full, &es) && S_ISDIR(es.st_mode);
+#else
+            bool isdir = e->d_type == DT_DIR;
+#endif
+            if ((isdir && !(d->mode & 1)) || (!isdir && !(d->mode & 2))) continue;
+            uint8_t *ent = out + n * 0x310;
+            memset(ent, 0, 0x310);
+            strncpy((char *)ent, e->d_name, 0x300);
+            ent[0x304] = isdir ? 0 : 1;
+            if (!isdir) {
+                char p[2048];
+                struct stat sb;
+                snprintf(p, sizeof p, "%s/%s", d->path, e->d_name);
+                if (!stat(p, &sb)) *(int64_t *)(ent + 0x308) = sb.st_size;
+            }
+            n++;
+        }
+        OUT(int64_t, 0) = n;
+        resp_size(resp, 8);
+        break;
+    }
+    case 1: {  // GetEntryCount
+        long pos = telldir(d->d);
+        rewinddir(d->d);
+        int64_t n = 0;
+        struct dirent *e;
+        while ((e = readdir(d->d)))
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) n++;
+        seekdir(d->d, pos);
+        OUT(int64_t, 0) = n;
+        resp_size(resp, 8);
+        break;
+    }
+    }
+}
+
+static int rm_rf(const char *p, bool keep_root) {
+    DIR *d = opendir(p);
+    if (!d) return unlink(p);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char c[2048];
+        snprintf(c, sizeof c, "%s/%s", p, e->d_name);
+        rm_rf(c, false);
+    }
+    closedir(d);
+    return keep_root ? 0 : rmdir(p);
+}
+
+static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
+    HostFs *fs = s->state;
+    char p[2048], p2[2048];
+    host_path(fs, in_path(req, 0), p, sizeof p);
+    switch (req->cmd) {
+    case 0: {  // CreateFile(option, size)
+        int fd = plat_open_file(p, O_CREAT | O_EXCL | O_RDWR);
+        if (fd < 0) { resp->result = errno_result(); break; }
+        if (ftruncate(fd, IN(int64_t, 8))) resp->result = errno_result();
+        close(fd);
+        break;
+    }
+    case 1: if (unlink(p)) resp->result = errno_result(); break;
+    case 2: if (mkdir(p, 0755)) resp->result = errno_result(); break;
+    case 3: if (rmdir(p)) resp->result = errno_result(); break;
+    case 4: if (rm_rf(p, false)) resp->result = errno_result(); break;
+    case 5: case 6:
+        host_path(fs, in_path(req, 1), p2, sizeof p2);
+        if (plat_rename(p, p2)) resp->result = errno_result();
+        break;
+    case 7: {  // GetEntryType
+        struct stat sb;
+        if (stat(p, &sb)) { resp->result = FS_PATH_NOT_FOUND; break; }
+        OUT(uint32_t, 0) = S_ISDIR(sb.st_mode) ? 0 : 1;
+        resp_size(resp, 4);
+        break;
+    }
+    case 8: {  // OpenFile(mode)
+        uint32_t mode = IN(uint32_t, 0);
+        bool save = fs->journaled && (mode & 2);
+        char work[2100];
+        struct stat sb;
+        int slot = -1, fd = -1;
+        bool scratch = false, dropped = false;
+        bool exists = !stat(p, &sb);
+        if (exists) slot = pending_of(fs, p, save, work, sizeof work);
+        if (slot >= 0) {
+            snprintf(p, sizeof p, "%s", work);
+        } else if (save && exists) {  // (its working copy can't be made)
+            save_failed(fs, "could not stage", p, errno);
+            fd = scratch_copy(p);
+            scratch = true;
+            if (fd < 0) {  // no scratch copy either: the writes are dropped (never sent to a read-only fd)
+                save_failed(fs, "could not make a scratch copy of", p, errno);
+                dropped = true;
+                fd = open(p, O_RDONLY);  // (reads still see the committed file; -1 if even that can't be opened)
+            }
+        }
+        // (plat_open_file: renamable / deletable while open, as on the console - Pokémon Z-A renames its save files)
+        if (fd < 0 && !scratch) fd = plat_open_file(p, (mode & 2) ? O_RDWR : O_RDONLY);
+        if (fd < 0 && !dropped) { resp->result = errno_result(); break; }
+        HostFile *f = calloc(1, sizeof *f);
+        f->fd = fd;
+        snprintf(f->path, sizeof f->path, "%s%s", p, dropped ? " (writes dropped)" : scratch ? " (scratch copy)" : "");
+        if (save) { f->fs = fs; f->slot = scratch ? -1 : slot; f->scratch = scratch; f->dropped = dropped; }
+        Service *fsvc = service_new("IFile", file, f);
+        fsvc->on_close = file_close;
+        ipc_return_object(resp, fsvc);
+        break;
+    }
+    case 9: {  // OpenDirectory(mode)
+        DIR *d = opendir(p);
+        if (!d) { resp->result = errno_result(); break; }
+        HostDir *hd = calloc(1, sizeof *hd);
+        hd->d = d;
+        hd->mode = (int)IN(uint32_t, 0);
+        snprintf(hd->path, sizeof hd->path, "%s", p);
+        Service *dsvc = service_new("IDirectory", directory, hd);
+        dsvc->on_close = dir_close;
+        ipc_return_object(resp, dsvc);
+        break;
+    }
+    case 10: commit(fs); break;  // Commit (always succeeds for the game: see save_failed)
+    case 11: case 12: OUT(int64_t, 0) = 0x40000000; resp_size(resp, 8); break;
+    case 13: rm_rf(p, true); break;
+    case 14: memset(resp->data, 0, 0x20); resp_size(resp, 0x20); break;
+    default: LOG("[fs] IFileSystem cmd %u (ok)\n", req->cmd);
+    }
+}
+
+static Service *open_host_fs(const char *sub) {
+    HostFs *fs = calloc(1, sizeof *fs);
+    if (getenv("LARECOMP_SAVE_DIR")) g_save_dir = getenv("LARECOMP_SAVE_DIR");  // test runs use a scratch copy
+    else if (rando_seed_dir()) {  // each randomizer seed has its own save slots
+        static char seed_save[600];
+        snprintf(seed_save, sizeof seed_save, "%s/save", rando_seed_dir());
+        g_save_dir = seed_save;
+    }
+    snprintf(fs->root, sizeof fs->root, "%s/%s", g_save_dir, sub);
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "%s", fs->root);
+    for (char *q = cmd + 1; *q; q++)
+        if (*q == '/') { *q = 0; mkdir(cmd, 0755); *q = '/'; }
+    mkdir(cmd, 0755);
+    // (Link's Awakening only: Pokémon Z-A renames its save files while they are open - a working copy wouldn't follow
+    // the rename - so its saves are written in place, as before the journal)
+    fs->journaled = strcmp(sub, "sdcard") != 0 && g_game_is_la;
+    pthread_mutex_lock(&g_mount_lock);
+    bool other_live = false;
+    for (int i = 0; i < LIVE_MOUNTS_MAX; i++)
+        if (g_live_mounts[i] && !strcmp(g_live_mounts[i]->root, fs->root)) other_live = true;
+    if (fs->journaled && other_live) LOG("[save] %s is still mounted: its working copies are left alone\n", fs->root);
+    if (fs->journaled && !other_live) {  // (a working copy left by a crash: never committed - dropped, as on the Switch)
+        if (!recover_save_flags(fs->root)) {
+            int error = errno;
+            pthread_mutex_unlock(&g_mount_lock);
+            free(fs);
+            errno = error;
+            return NULL;
+        }
+        DIR *d = opendir(fs->root);
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            size_t l = strlen(e->d_name);
+            if (l > 8 && !strcmp(e->d_name + l - 8, ".pending")) {
+                char stale[1300];
+                snprintf(stale, sizeof stale, "%s/%s", fs->root, e->d_name);
+                LOG("[save] dropping uncommitted %s\n", stale);
+                unlink(stale);
+            }
+        }
+        if (d) closedir(d);
+    }
+    for (int i = 0; fs->journaled && i < LIVE_MOUNTS_MAX; i++)
+        if (!g_live_mounts[i]) { g_live_mounts[i] = fs, fs->live = true; break; }
+    pthread_mutex_unlock(&g_mount_lock);
+    LOG("[fs] mounted host directory %s\n", fs->root);
+    Service *svc = service_new("IFileSystem", filesystem, fs);
+    svc->on_close = fs_unmount;
+    return svc;
+}
+
+// ------------------------------------------------------------------ fsp-srv
+SERVICE("fsp-srv", fsp_srv) {
+    (void)s;
+    switch (req->cmd) {
+    case 1: break;  // SetCurrentProcess
+    case 18: ipc_return_object(resp, open_host_fs("sdcard")); break;
+    case 22: break;  // CreateSaveDataFileSystem
+    case 51: case 53: {  // OpenSaveDataFileSystem(space, attribute)
+        uint8_t type = IN(uint8_t, 0x8 + 0x18);  // attribute.type
+        char sub[64];
+        snprintf(sub, sizeof sub, "save_%u", type);
+        Service *mount = open_host_fs(sub);
+        if (mount) ipc_return_object(resp, mount);
+        else resp->result = errno_result();
+        break;
+    }
+    case 200: ipc_return_object(resp, open_romfs_storage()); break;  // OpenDataStorageByCurrentProcess
+    case 202: {  // OpenDataStorageByDataId: add-on content (the game root's aoc/<id>.bin, services/misc.c), no system data
+        uint64_t id = IN(uint64_t, 8);
+        char path[1100];
+        snprintf(path, sizeof path, "%s", g_romfs_dir);
+        char *slash = strrchr(path, '/');
+        snprintf(slash ? slash + 1 : path, sizeof path - (slash ? (size_t)(slash + 1 - path) : 0), "aoc/%016llx.bin",
+                 (unsigned long long)id);
+        int fd = open(path, O_RDONLY | O_BINARY);
+        if (fd < 0) {
+            LOG("[fs] OpenDataStorageByDataId %llx (not available)\n", (unsigned long long)id);
+            resp->result = MAKE_RESULT(2, 1001);
+            break;
+        }
+        Storage *st = calloc(1, sizeof *st);
+        st->fd = fd;
+        struct stat sb;
+        fstat(fd, &sb);
+        st->size = sb.st_size;
+        LOG("[fs] add-on content %016llx: %s\n", (unsigned long long)id, path);
+        ipc_return_object(resp, service_new("IStorage(aoc)", plain_storage, st));
+        break;
+    }
+    case 1005: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetGlobalAccessLogMode
+    case 1003: case 1004: case 1006: break;
+    case 1011: memset(resp->data, 0, 0x10); resp_size(resp, 0x10); break;
+    default: LOG("[fs] fsp-srv cmd %u (ok)\n", req->cmd);
+    }
+}
