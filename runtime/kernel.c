@@ -233,12 +233,39 @@ static void region_remove(uint64_t addr) {
 // beyond it fails with LimitReached - Pokémon Z-A maps all the free memory as one pool, then keeps asking for 4 MB
 // pieces until refused. Off by default (LARECOMP_PHYS_LIMIT=1): with the limit the game keeps fewer characters / props
 // loaded than on Ryujinx with its own (smaller) baseline - the 64 MB estimate is not what the hardware counts.
-#define APP_MEMORY 0xCD500000ull
+#define APP_MEMORY_HW 0xCD500000ull
+// Scarlet / Violet: EXTRA more memory for the game's GlobalHeap and GPU arenas (4K shadows etc. need more than the
+// console's). Reported as application memory + 2 x EXTRA with EXTRA counted as used (as the PokeV port does).
+// LARECOMP_EXTRA_MEMORY_MB=<n> overrides (0: none, at most 512); default 0.
+static uint64_t extra_memory(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_EXTRA_MEMORY_MB");
+        v = e ? (int64_t)atoll(e) << 20 : 0;
+        if (v < 0 || v > (512ll << 20)) v = v < 0 ? 0 : 512ll << 20;
+        if (v) LOG("[kernel] %lld MB more memory for the game%s\n", (long long)(v >> 20), e ? " (LARECOMP_EXTRA_MEMORY_MB)" : "");
+    }
+    return (uint64_t)v;
+}
+// The game's GPU arena (NVN pools; a fixed 268 MB on the console) is what is left of the application memory after its
+// GlobalHeap: reporting more application memory WITHOUT counting it as used grows only that arena. 4K shadows (the
+// 4K Shadows code mod) ask 128 MB there. LARECOMP_ARENA_EXTRA_MB=<n> (default 192, 0: as the console, at most 512).
+static uint64_t arena_extra(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_ARENA_EXTRA_MB");
+        v = e ? (int64_t)atoll(e) << 20 : 192ll << 20;
+        if (v < 0 || v > (512ll << 20)) v = v < 0 ? 0 : 512ll << 20;
+        if (v) LOG("[kernel] %lld MB more application memory for the game's GPU arena\n", (long long)(v >> 20));
+    }
+    return (uint64_t)v;
+}
+#define APP_MEMORY (APP_MEMORY_HW + 2 * extra_memory() + arena_extra())
 static uint64_t phys_mapped;
 static int phys_limit = -1;  // LARECOMP_PHYS_LIMIT=1: count physical memory as used and refuse mappings past APP_MEMORY
 static uint64_t used_memory(void) {
     if (phys_limit < 0) phys_limit = getenv("LARECOMP_PHYS_LIMIT") != NULL;
-    return heap_size + (phys_limit ? phys_mapped : 0) + 0x4000000ull;
+    return heap_size + (phys_limit ? phys_mapped : 0) + 0x4000000ull + extra_memory();
 }
 
 // bytes of [addr, addr + size) not mapped yet (physical memory regions)
@@ -375,8 +402,11 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     pthread_mutex_lock(&g_klock);  // (threads create threads at once: two must never get the same id / TLS)
     t->id = next_thread_id++;
     t->tlr = tls_next;
-    tls_next += 0x200;
+    tls_next += 0x1000;
+    memset((void *)(uintptr_t)t->tlr, 0, 0x1000);
     t->cpu.tpidrro = t->tlr;
+    t->cpu.tpidr = t->tlr + 0x200;  // Violet: thread-local storage (SDK/musl read tpidr_el0)
+    *(uint64_t *)(uintptr_t)(t->tlr + 0x1f0) = t->cpu.tpidr;
     t->anext = g_threads;
     g_threads = t;
     pthread_mutex_unlock(&g_klock);
@@ -1370,6 +1400,12 @@ void kernel_init(void) {
     }
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
+        region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
+        region_add(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
+        region_add(m->base + m->data_off, m->size - m->data_off, 4, 3);
+    }
+    if (g_subsdk.base) {
+        Module *m = &g_subsdk;
         region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
         region_add(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
         region_add(m->base + m->data_off, m->size - m->data_off, 4, 3);

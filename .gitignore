@@ -39,3 +39,7 @@ CLAUDE.local.md
 
 # players' bug recordings (runtime/bugrec.c): their saves
 bug-reports/
+
+# local build trees (generated game code)
+build_*/
+generated_*/

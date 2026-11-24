@@ -89,6 +89,7 @@ static void module_init(Cpu *c, Module *m) {
         static bool once;
         if (!once) once = true, rt_watch_poll_start();
     }
+    if (getenv("LARECOMP_RELOC_DEBUG")) LOG("[dbg] at init 0x7004759418 = %llx\n", (unsigned long long)*(uint64_t *)0x7004759418ull);
     LOG("init %s (DT_INIT %llx, %llu init_array entries)\n", m->name, m->init, m->init_array_sz / 8);
     if (m->init) guest_call(c, m->init);
     else run_array(c, m->init_array, m->init_array_sz);
@@ -101,6 +102,7 @@ static void rtld_init_sdk(Cpu *c) { module_init(c, &g_modules[1]); }
 // InitializeNpad then aborted on the other one (2202-1045). What the mods write into the game's code during their
 // start becomes hooks right after (runtime/hle/codehooks.c), before main's own start.
 static void rtld_init_main(Cpu *c) {
+    if (g_subsdk.base) module_init(c, &g_subsdk);  // (the game's own subsdk0 starts before main's)
     if (g_nmodules > 2) {
         extern void hooks_capture(void), loader_ro_modules(void);
         loader_ro_modules();  // (rtld's module list, which they walk: loader.c; after the SDK's start, which clears it)
@@ -343,14 +345,15 @@ int main(int argc, char **argv) {
         static const uint8_t za_build[][8] = {{0x72, 0x22, 0xe1, 0x3e, 0xcf, 0x6a, 0xdb, 0x32},
                                               {0x8a, 0x1c, 0x86, 0xc4, 0x37, 0x39, 0x4b, 0x69},
                                               {0xb1, 0xf1, 0x2f, 0xd9, 0x19, 0xea, 0xe8, 0x6a},
-                                              {0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64}};  // (the last: Pokémon Violet 4.0.0)
+                                              {0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64},
+                                              {0x42, 0x1c, 0x54, 0x11, 0xb4, 0x87, 0xeb, 0x4d}};  // (the last two: Pokémon Violet / Scarlet 4.0.0)
         char mp[1100];
         uint8_t id[8] = {0};
         snprintf(mp, sizeof mp, "%s/exefs/main", root);
         FILE *f = fopen(mp, "rb");
         if (f) { fseek(f, 0x40, SEEK_SET); if (fread(id, 1, 8, f) != 8) memset(id, 0, 8); fclose(f); }
         if (!memcmp(id, za_build[0], 8) || !memcmp(id, za_build[1], 8) || !memcmp(id, za_build[2], 8) ||
-            !memcmp(id, za_build[3], 8)) {
+            !memcmp(id, za_build[3], 8) || !memcmp(id, za_build[4], 8)) {
             // (the start screen is ZA Recomp's own since v0.1.9: shown on every start, set up or not - Play,
             // Mods, Saves; --play still goes straight into the game)
 #ifdef _WIN32

@@ -111,9 +111,12 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
 static Elf64Sym *sym(Module *m, uint64_t i) { return (Elf64Sym *)m->symtab + i; }
 static const char *symname(Module *m, Elf64Sym *s) { return (const char *)(m->strtab + s->name); }
 
+Module g_subsdk;  // (the game's own subsdk0, outside g_modules: g_nmodules > 2 means code mods)
+
 uint64_t loader_find_symbol(const char *name) {
-    for (int mi = 0; mi < g_nmodules; mi++) {
-        Module *m = &g_modules[mi];
+    for (int mi = 0; mi <= g_nmodules; mi++) {
+        Module *m = mi < g_nmodules ? &g_modules[mi] : &g_subsdk;
+        if (!m->base) continue;
         for (uint64_t i = 1; i < m->nsyms; i++) {
             Elf64Sym *s = sym(m, i);
             if (s->shndx && !strcmp(symname(m, s), name)) return m->base + s->value;
@@ -125,8 +128,9 @@ uint64_t loader_find_symbol(const char *name) {
 const char *loader_symbol_at(uint64_t addr, uint64_t *offset) {
     const char *best = NULL;
     uint64_t best_addr = 0;
-    for (int mi = 0; mi < g_nmodules; mi++) {
-        Module *m = &g_modules[mi];
+    for (int mi = 0; mi <= g_nmodules; mi++) {
+        Module *m = mi < g_nmodules ? &g_modules[mi] : &g_subsdk;
+        if (!m->base) continue;
         if (addr < m->base || addr >= m->base + m->size) continue;
         for (uint64_t i = 1; i < m->nsyms; i++) {
             Elf64Sym *s = sym(m, i);
@@ -298,7 +302,7 @@ static void relocate(Module *m) {
             case R_JUMP_SLOT: {
                 uint64_t s = resolve(m, si);
                 *where = s ? s + r[i].addend : 0;
-                if (s >= HLE_BASE && s < HLE_BASE + HLE_SIZE) unresolved++;
+                if (s >= HLE_BASE && s < HLE_BASE + HLE_SIZE) { unresolved++; if (getenv("LARECOMP_RELOC_DEBUG")) LOG("[reloc] %s stub %s\n", m->name, symname(m, sym(m, si))); }
                 break;
             }
             default: FATAL("%s: reloc type %u\n", m->name, type);
@@ -327,7 +331,17 @@ void loader_load(const char *exefs) {
         snprintf(path, sizeof path, "%s/%s", exefs, m->name);
         load_nso(m, path, mods[i].base);
     }
+    memset(&g_subsdk, 0, sizeof g_subsdk);
+    snprintf(path, sizeof path, "%s/subsdk0", exefs);
+    FILE *sf = fopen(path, "rb");
+    if (sf) {
+        fclose(sf);
+        g_subsdk.name = "subsdk0";
+        load_nso(&g_subsdk, path, SUBSDK_BASE);
+    }
     for (int i = 0; i < g_nmodules; i++) relocate(&g_modules[i]);
+    if (g_subsdk.base) relocate(&g_subsdk);
+    if (getenv("LARECOMP_RELOC_DEBUG")) LOG("[dbg] after reloc 0x7004759418 = %llx, 0x7004759430 = %llx\n", (unsigned long long)*(uint64_t *)0x7004759418ull, (unsigned long long)*(uint64_t *)0x7004759430ull);
 }
 
 // exefs/rtld, just below the guest window, for code mods: exlaunch takes the memory map's 1st code module as rtld and

@@ -4,6 +4,7 @@ import struct
 
 # main's build ID (first 16 hex digits) -> version
 SV_BUILDS = {
+    '421c5411b487eb4d': '4.0.0',  # Pokémon Scarlet v786432 (4.0.0; main differs from Violet's by two words, same addresses)
     '709bfd6611529864': '4.0.0',  # Pokémon Violet v786432 (4.0.0; called 3.0.1 here until v0.0.28, issue #3)
 }
 
@@ -107,6 +108,17 @@ def _sv_proj_aspect_s4(gen, a):
     return _sv_proj_aspect(gen, a, 4, 0xbd419264)   # ldr s4, [x19, #0x190]
 
 
+def _sv_arena(gen, a):
+    # 0x700146e770: movz w9, #0x10c0, lsl #16 - the size of the game's GPU arena (NVN pools: textures, render targets),
+    # 268 MB on the console. The 4K Shadows code mod asks 128 MB of it for one shadow map (8 MB in the game): past the
+    # arena (145 MB used before it) the allocation failed and the game crashed. 400 MB (the runtime reports 192 MB more
+    # application memory for it, kernel.c arena_extra: the pool the game maps is application memory - used).
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x52a21809, hex(w)  # movz w9, #0x10c0, lsl #16
+    return ('{ c->x[9] = 0x19000000ull; }'
+            f'  /* {a:#x}: SV 4.0.0 GPU arena 400 MB (4K shadows) */')
+
+
 def sv_patches(build):
     if build.lower() in SV_BUILDS:
         return {
@@ -119,5 +131,6 @@ def sv_patches(build):
             0x7000cf11e8: _sv_proj_aspect_s16,
             0x7000cf182c: _sv_proj_half_fovy,
             0x7000cf18a4: _sv_proj_aspect_s4,
+            0x700146e770: _sv_arena,
         }
     return {}

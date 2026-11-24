@@ -145,7 +145,9 @@ void dispatch_init(void) {  // (after gamelib_load)
     uint64_t nm = *g->main_count, ns = *g->sdk_count;
     tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, g->main_addrs[0], g->main_addrs[nm - 1]};
     tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, g->sdk_addrs[0], g->sdk_addrs[ns - 1]};
-    ntables = 2;  // (a reboot: the code mods add theirs again, runtime/codemods.c)
+    ntables = 2;
+    if (g->sub_count && *g->sub_count) tables[ntables++] = (FnTable){g->sub_addrs, g->sub_fns, *g->sub_count, g->sub_addrs[0], g->sub_addrs[*g->sub_count - 1]};
+    // (a reboot: the code mods add theirs again, runtime/codemods.c)
 }
 
 bool dispatch_add_table(const uint64_t *addrs, const GuestFn *fns, uint64_t count) {

@@ -314,3 +314,77 @@ static void prepo_log(IpcReq *req) {
 }
 SERVICE("prepo:u", prepo_u) { (void)s; prepo_log(req); resp_size(resp, 0x10); }
 SERVICE("prepo:a", prepo_a) { (void)s; prepo_log(req); resp_size(resp, 0x10); }
+
+// ------------------------------------------------------------------ btm:u / btm:m / btm:s / btm / bt
+// Bluetooth manager: Pokémon Scarlet & Violet initializes the Bluetooth user interface (InitializeBtmUserInterface)
+// and acquires the BLE scan event (AcquireBleScanEvent) at boot to communicate with Pokémon GO Plus+ and wireless accessories.
+// Switchbrew cmd 23 (AcquireBleScanEvent) and other BLE event acquisition commands return:
+//   - An auto-clear Event handle in copy_handles
+//   - An output boolean (1 = true) in the response buffer (out_bool == 0 causes user process to abort)
+static void btm_user_core(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    resp->result = 0;
+    resp->copy_handles[resp->ncopy++] = new_event_handle();
+    OUT(uint8_t, 0) = 1;
+    OUT(uint32_t, 0) = 1;
+    resp_size(resp, 4);
+    LOG("[btm] IBtmUserCore cmd %u (ok, event returned)\n", req->cmd);
+}
+
+static void btm_service(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    resp->result = 0;
+    switch (req->cmd) {
+    case 0:  // GetCore -> returns IBtmUserCore
+        ipc_return_object(resp, service_new("IBtmUserCore", btm_user_core, NULL));
+        break;
+    default:
+        LOG("[btm] %s cmd %u (ok)\n", s->name, req->cmd);
+        resp_size(resp, 0x10);
+        break;
+    }
+}
+SERVICE("btm:u", btm_u) { btm_service(s, req, resp); }
+SERVICE("btm:m", btm_m) { btm_service(s, req, resp); }
+SERVICE("btm:s", btm_s) { btm_service(s, req, resp); }
+SERVICE("btm", btm) { btm_service(s, req, resp); }
+
+static void bt_service(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    resp->result = 0;
+    switch (req->cmd) {
+    case 0:
+        ipc_return_object(resp, service_new("IBtService", btm_user_core, NULL));
+        break;
+    default:
+        LOG("[bt] cmd %u (ok)\n", req->cmd);
+        resp_size(resp, 0x10);
+        break;
+    }
+}
+SERVICE("bt", bt) { bt_service(s, req, resp); }
+
+
+// ------------------------------------------------------------------ ectx:aw / ectx:r
+static void ectx_context(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    resp->result = 0;
+    resp_size(resp, 0x10);
+}
+
+static void ectx_service(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    resp->result = 0;
+    switch (req->cmd) {
+    case 0: case 1:
+        ipc_return_object(resp, service_new("IErrorContext", ectx_context, NULL));
+        break;
+    default:
+        LOG("[ectx] %s cmd %u (ok)\n", s->name, req->cmd);
+        resp_size(resp, 0x10);
+        break;
+    }
+}
+SERVICE("ectx:aw", ectx_aw) { ectx_service(s, req, resp); }
+SERVICE("ectx:r", ectx_r) { ectx_service(s, req, resp); }
+

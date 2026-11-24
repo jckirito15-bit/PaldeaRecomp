@@ -36,10 +36,11 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 #endif
 #define MAIN_BASE    0x7000000000ull
 #define SDK_BASE     0x7008000000ull   // (128 MB for main: Pokémon Legends Z-A's image is 0x5f7a000)
+#define SUBSDK_BASE  0x700a000000ull   // Violet's subsdk0 (the game's own, loaded by loader_load)
 #define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
 #define TLS_BASE     0x7090000000ull
-#define TLS_SIZE     0x0000100000ull
+#define TLS_SIZE     0x0000400000ull
 #define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
 #define HLE_HEAP_SIZE 0x000E000000ull
 #ifdef __APPLE__
@@ -50,7 +51,7 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 #define ALIAS_SIZE   0x0400000000ull   // 16 GB, up to GUEST_HI
 #endif
 #define HEAP_BASE    0x7240000000ull
-#define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+#define HEAP_MAX     0x00F0000000ull   // 3.75 GB
 
 // ---- the game (kernel.c; set from exefs/main.npdm by main.c)
 extern uint64_t g_program_id;  // GetInfo 18, Link's Awakening's by default
@@ -68,6 +69,7 @@ typedef struct Module {
 
 extern Module g_modules[6];
 extern int g_nmodules;
+extern Module g_subsdk;  // exefs/subsdk0 of the game itself (base 0: none)
 extern Module g_rtld;  // (exefs/rtld, mapped only for code mods: loader_map_rtld; base 0: not)
 void loader_map_rtld(const char *exefs);
 Module *loader_load_mod(const char *path, uint64_t base, const char *name);  // a code mod's NSO, after them
