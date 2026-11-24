@@ -271,7 +271,11 @@ class Module:
         # find the guarding b.hi / b.hs and its cmp, scanning backwards
         a = br_pc - 4
         guard = cmp = None
-        while a >= entry and br_pc - a <= 4 * 16:
+        # (48 instructions back, not 16: Scarlet / Violet's f_7001d1e6dc computes 15 field addresses between its
+        # b.hi and the br - a byte table of offsets from 0x7001d1e7a8 - and the table was missed: the jump went to
+        # rt_dispatch, "no function at 7001d1e7a8 / 7001d1e8c8" (crashes setting up a picnic, PokeV-Recomp #18, and
+        # back from the false dragon Titan, #19). The emulation still checks every target.)
+        while a >= entry and br_pc - a <= 4 * 48:
             w = self.word(a)
             if (w & 0xFF000010) == 0x54000000 and bits(w, 0, 4) in (8, 2):
                 guard = a
