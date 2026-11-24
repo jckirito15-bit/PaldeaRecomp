@@ -3163,6 +3163,14 @@ typedef struct {
 } PipeIn;
 
 // vl (optional): the vertex layout, also when the key leaves it out (dynamic vertex input)
+// Alpha-to-coverage only on multisampled attachments (PokeV-Recomp 72e44b8): on a 1-sample one the driver turns alpha
+// into a dither pattern (hair / foliage edges as scanlines); the PokeV baseline draws them with it off. LARECOMP_A2C=0/1 forces.
+static uint8_t a2c_for(bool asked, uint32_t samples) {
+    static int env = -2;
+    if (env == -2) { const char *e = ENV("LARECOMP_A2C"); env = e ? atoi(e) != 0 : -1; }
+    return env >= 0 ? (uint8_t)env : (uint8_t)(asked && samples > 1);
+}
+
 static void pipe_key_fill(PipeKey *k, Prog *pr, const PipeIn *in, const VkFormat color[8], uint32_t ncolor, VkFormat depth,
                           VkFormat stencil, uint32_t samples, VtxLayout *vl) {
     memset(k, 0, sizeof *k);
@@ -3217,7 +3225,7 @@ static void pipe_key_fill(PipeKey *k, Prog *pr, const PipeIn *in, const VkFormat
             memcpy(k->blend[i], in->blend[i], 8);
         }
     }
-    k->a2c = in->a2c;
+    k->a2c = a2c_for(in->a2c, k->samples);
     k->topo_class = in->topo_class;
     k->poly_fill = in->poly_fill;
 }
@@ -3441,6 +3449,7 @@ static void set_vertex_input(VkCommandBuffer cb, const VtxLayout *l) {
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
+static TexBackend *feedback_img[4];  // (the snapshot behind each view: a slot in stencil mode takes its own view of it)
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
@@ -3467,6 +3476,19 @@ static bool is_attachment(NvnTexture *t) {
     if (!t) return false;
     if (t == st.rt.depth) return true;
     for (int i = 0; i < st.rt.ncolor; i++) if (t == st.rt.color[i]) return true;
+    return false;
+}
+
+// A draw that can change its depth/stencil target's stencil: the test on, a write mask, and an operation other than
+// KEEP on either face. The snapshots hold the stencil too (a slot in stencil mode reads it, texture_info), so such a
+// draw ends them as a depth write does. (PokeV-Recomp 4bb15e7)
+static bool draw_writes_stencil(void) {
+    if (!st.ds[3] || !((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)) return false;
+    uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;  // (two faces x fail / depth fail / pass, a nibble each)
+    for (int k = 0; k < 6; k++) {
+        uint32_t o = (ops >> (k * 4)) & 0xF;
+        if (o >= 2 && o <= 8) return true;  // (stencil_op: anything else is KEEP)
+    }
     return false;
 }
 
@@ -3947,7 +3969,7 @@ static void resolve_feedback(Prog *pr) {
             if (nosnap < 0) nosnap = ENV("LARECOMP_NO_SNAPSHOT_REUSE") != NULL;
             int si = -1;
             for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
-            bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
+            bool self_write = t == st.rt.depth && ((st.ds[0] && st.ds[1]) || draw_writes_stencil());
             TexBackend *src = vk_tex(t, true);
             Snap *existing = NULL;
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
@@ -3955,6 +3977,7 @@ static void resolve_feedback(Prog *pr) {
             static const VkComponentMapping id = {0};
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
                 feedback_tex[nfeedback] = t;
+                feedback_img[nfeedback] = &existing->copy;
                 feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
             }
@@ -4013,6 +4036,7 @@ static void resolve_feedback(Prog *pr) {
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
+            feedback_img[nfeedback] = dst;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
@@ -6880,6 +6904,18 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
+                    // The snapshot's view above is its depth, whatever the slot asked for. A slot in NVN depth/stencil
+                    // mode STENCIL (the view's, else the texture's - as vk_view) reads the snapshot's stencil instead:
+                    // Scarlet / Violet's deferred lighting samples the scene's depth/stencil while it is the pass's depth
+                    // attachment, once as depth and once through a STENCIL view (shading model bits 0..2, "skip" bit 6);
+                    // its usampler2D got the depth view - the depth's bits, a lattice along each triangle's plane: the
+                    // stripes / per-triangle pixel noise on every lit surface (PokeV-Recomp 4bb15e7, v0.0.14)
+                    TexBackend *fb = feedback_img[k];
+                    if (fb && (fb->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (fb->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                        (e->has_view && (e->view.setmask & 16) ? e->view.ds_mode : e->tex->ds_mode) == 1) {
+                        static const VkComponentMapping id = {0};
+                        view = vk_image_view(fb, VK_IMAGE_VIEW_TYPE_2D, fb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT);
+                    }
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
         } else if (e->dead_format) {
@@ -7984,7 +8020,7 @@ static void rec_from_state(ShaderRec *r, bool flip_x, uint32_t mode) {
         r->depth = st.rt.depth->format;
         if (!r->ncolor && st.rt.depth->samples > 1) r->samples = st.rt.depth->samples;
     }
-    r->a2c = st.ms[0xC] != 0;
+    r->a2c = a2c_for(st.ms[0xC] != 0, r->samples);
     r->topo = shader_topo_class(mode);
     r->poly_fill = st.poly[2] != 1;
 }
@@ -8482,7 +8518,7 @@ static void draw_(CmdRec *r, bool indexed) {
     alias_draw_check();
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
-    if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
+    if (st.rt.depth && ((st.ds[0] && st.ds[1]) || draw_writes_stencil())) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
@@ -8505,7 +8541,7 @@ static void draw_(CmdRec *r, bool indexed) {
     uint32_t rt_fmt[8] = {0};
     for (int i = 0; i < st.rt.ncolor && i < 8; i++) rt_fmt[i] = st.rt.color[i] ? st.rt.color[i]->format : 0;
     const PipeIn in = {st.attrib, st.nattrib, (const uint32_t (*)[2])st.stream, st.nstream, rt_fmt, st.channel_mask,
-                       st.color_state[0], (const uint8_t (*)[8])st.blend, st.ms[0xC] != 0, cls, st.poly[2] != 1};
+                       st.color_state[0], (const uint8_t (*)[8])st.blend, a2c_for(st.ms[0xC] != 0, pass_samples), cls, st.poly[2] != 1};
     // the key's parts draw_ adds to pipe_key_fill's: the depth clamp (in depth-only passes - shadow maps: the casters past
     // the light's planes - and in passes without depth - the UI: its quads ask for it, and some lie outside the depth
     // range, the item-count window after using a candy stayed hidden; not in colour passes with depth: Vulkan's clamp
@@ -9201,7 +9237,26 @@ static void fc_blob_mem(FILE *f, uint32_t kind, uint32_t slot, uint64_t addr, ui
     if (wl != 0xFFFFFFFFu) fwrite(data, 1, len, f);
     (*n)++;
 }
+// (a stale binding can name an address that is not mapped: the capture skips those instead of crashing)
+#ifdef _WIN32
+typedef struct { void *base, *alloc; uint32_t aprot; uint16_t pad1; uint64_t size; uint32_t state, prot, type, pad2; } FcMbi;  // (MEMORY_BASIC_INFORMATION)
+__declspec(dllimport) uint64_t __stdcall VirtualQuery(const void *, FcMbi *, uint64_t);
+#endif
+static bool fc_readable(uint64_t addr, uint64_t len) {
+#ifdef _WIN32
+    uint64_t a = addr, end = addr + len;
+    while (a < end) {
+        FcMbi m;
+        if (!VirtualQuery((const void *)(uintptr_t)a, &m, sizeof m) || m.state != 0x1000 /* MEM_COMMIT */ || (m.prot & 0x101 /* NOACCESS | GUARD */))
+            return false;
+        a = (uint64_t)(uintptr_t)m.base + m.size;
+    }
+#endif
+    return true;
+}
 static void fc_blob(FILE *f, uint32_t kind, uint32_t slot, uint64_t addr, uint64_t size, uint64_t cap, uint32_t *n) {
+    uint64_t len = size < cap ? size : cap;
+    if (addr && len && !fc_readable(addr, len)) return;
     fc_blob_mem(f, kind, slot, addr, size, (const void *)(uintptr_t)addr, cap, n);
 }
 typedef struct { uint32_t index, slot, tic, format; uint64_t handle, object, addr; uint32_t width, height, levels, pad; } FcTex;
@@ -9298,8 +9353,8 @@ static void fullcap_draw(Prog *pr, CmdRec *r, bool indexed, uint32_t inst, int n
     uint32_t nb = 0;
     fwrite(&nb, 4, 1, f);
     for (int c = 3; c < 18; c++) {
-        if ((pr->vi->cbuf_mask >> c) & 1) fc_blob(f, 1, c, st.ubuf[0][c - 3].addr, st.ubuf[0][c - 3].size, 65536, &nb);
-        if ((pr->fi->cbuf_mask >> c) & 1) fc_blob(f, 2, c, st.ubuf[1][c - 3].addr, st.ubuf[1][c - 3].size, 65536, &nb);
+        if (pr->vi && (pr->vi->cbuf_mask >> c) & 1) fc_blob(f, 1, c, st.ubuf[0][c - 3].addr, st.ubuf[0][c - 3].size, 65536, &nb);
+        if (pr->fi && (pr->fi->cbuf_mask >> c) & 1) fc_blob(f, 2, c, st.ubuf[1][c - 3].addr, st.ubuf[1][c - 3].size, 65536, &nb);
     }
     for (int i = 0; i < 16; i++) {
         fc_blob(f, 3, i, st.sbuf[0][i].addr, st.sbuf[0][i].size, 1 << 20, &nb);
